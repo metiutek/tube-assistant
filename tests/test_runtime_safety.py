@@ -115,7 +115,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                         "video_keywords": ["office"],
                     }), \
                     patch.object(agent, "genera_audio", side_effect=fake_audio), \
-                    patch.object(agent, "scarica_clips", return_value=["clip.mp4"]), \
+                    patch("moduli.asset.scarica_clips", return_value=["clip.mp4"]), \
                     patch.object(agent, "monta_video", side_effect=fake_video), \
                     patch.object(agent, "genera_thumbnail", side_effect=fake_thumb), \
                     patch.object(agent, "pubblica_video", side_effect=fake_publish), \
@@ -159,24 +159,54 @@ class RuntimeSafetyTests(unittest.TestCase):
         from moduli import cervello
 
         short = _json.dumps({
-            "title": "T", "description": "D", "tags": ["a"],
+            "title": "Topic explained", "description": "About topic", "tags": ["topic"],
             "script": "too short", "video_keywords": ["office"],
         })
+        # durata default 8 min * 150 parole/min = 1200 parole di target
         good = _json.dumps({
-            "title": "T", "description": "D", "tags": ["a"],
-            "script": "word " * 600, "video_keywords": ["office"],
+            "title": "Topic explained", "description": "About topic", "tags": ["topic"],
+            "script": "word " * 1200, "video_keywords": ["office"],
         })
 
-        # primo tentativo corto, secondo valido → ritorna il valido
-        with patch.object(cervello, "chat_ollama", side_effect=[short, good]) as mock_chat:
+        # primo tentativo corto: si chiede una CONTINUAZIONE (prosa, non JSON)
+        # invece di rigenerare tutto — e con quella si arriva a target
+        continuazione = "parola " * 1200
+        with patch.object(cervello, "chat_ollama",
+                          side_effect=[short, continuazione]) as mock_chat:
             content = cervello.genera_contenuto("topic")
         self.assertEqual(mock_chat.call_count, 2)
-        self.assertGreaterEqual(len(content["script"].split()), 150)
+        self.assertGreaterEqual(len(content["script"].split()), 960)
 
-        # sempre corto → ValueError dopo 2 tentativi
-        with patch.object(cervello, "chat_ollama", side_effect=[short, short]):
+        # sempre corto e nemmeno la continuazione aiuta → ValueError dopo
+        # TENTATIVI_CONTENUTO generazioni complete
+        inutile = "niente"
+        with patch.object(cervello, "chat_ollama",
+                          side_effect=[short, inutile] * cervello.TENTATIVI_CONTENUTO):
             with self.assertRaises(ValueError):
                 cervello.genera_contenuto("topic")
+
+    def test_script_sotto_target_ma_usabile_viene_accettato(self):
+        """Gli LLM contano male le parole e stanno quasi sempre sotto il
+        target: dopo i tentativi si tiene lo script piu' lungo ottenuto,
+        purche' sopra la soglia minima — meglio un video corto che nessuno."""
+        import json as _json
+        from moduli import cervello
+
+        def script(n):
+            return _json.dumps({
+                "title": "Topic explained", "description": "About topic", "tags": ["topic"],
+                "script": "word " * n, "video_keywords": ["office"],
+            })
+
+        # target 8 min * 150 = 1200 parole; soglia buona 960, minima 600.
+        # "" = continuazione inutilizzabile, cosi' nessun tentativo arriva a
+        # target e si verifica davvero il ripiego sul piu' lungo.
+        risposte = [script(620), "", script(700), "", script(650), ""]
+        with patch.object(cervello, "chat_ollama", side_effect=risposte) as mock:
+            content = cervello.genera_contenuto("topic")
+        self.assertEqual(mock.call_count, len(risposte))
+        # tiene il piu' lungo dei tre, non il primo
+        self.assertEqual(len(content["script"].split()), 700)
 
     def test_common_errors_get_human_explanation(self):
         import importlib
@@ -318,7 +348,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                         "script": "hello world", "video_keywords": ["office"],
                     }), \
                     patch.object(agent, "genera_audio", side_effect=fake_file), \
-                    patch.object(agent, "scarica_clips", return_value=["clip.mp4"]), \
+                    patch("moduli.asset.scarica_clips", return_value=["clip.mp4"]), \
                     patch.object(agent, "monta_video", side_effect=fake_video), \
                     patch.object(agent, "genera_thumbnail", side_effect=fake_file), \
                     patch.object(agent, "pubblica_video", return_value="vid1"), \
