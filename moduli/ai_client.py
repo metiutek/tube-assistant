@@ -53,7 +53,7 @@ AZURE_OPENAI_ENDPOINT   = os.environ.get("AZURE_OPENAI_ENDPOINT",   "")
 AZURE_OPENAI_API_VERSION= os.environ.get("AZURE_OPENAI_API_VERSION","2024-08-01-preview")
 
 OLLAMA_CLOUD_URL   = "https://ollama.com/api/chat"
-OLLAMA_CLOUD_MODEL = "nemotron-3-super:cloud"
+OLLAMA_CLOUD_MODEL = os.environ.get("OLLAMA_CLOUD_MODEL", "nemotron-3-super:cloud")
 OLLAMA_LOCAL_URL   = "http://localhost:11434/api/chat"
 OLLAMA_LOCAL_MODEL = os.environ.get("OLLAMA_LOCAL_MODEL", "llama3.2")
 
@@ -255,32 +255,77 @@ def _azure_openai(messages: list, max_tokens: int = 4096) -> str:
     return resp.choices[0].message.content.strip()
 
 
+class RispostaVuota(RuntimeError):
+    """Il modello ha risposto senza contenuto utile (solo ragionamento)."""
+
+
+# Quanti tentativi per chiamata e di quanto allargare il budget token a ogni
+# ritentativo: il ragionamento va pagato in piu', non ignorato.
+RITENTATIVI_OLLAMA = 2
+FATTORE_BUDGET = 4
+
+
+def _testo_ollama(payload: dict, modello: str) -> str:
+    """Estrae il testo utile da una risposta Ollama.
+
+    I modelli reasoning (nemotron, gpt-oss, qwen) riempiono `thinking` e
+    lasciano `content` vuoto quando il ragionamento consuma tutto il budget.
+    Il vecchio `content or thinking` spediva il monologo del modello ("We need
+    to output a short phrase 3-7 words...") dritto nel titolo del video: meglio
+    sollevare e lasciare che il chiamante ritenti con piu' token.
+    """
+    payload = payload or {}
+    msg = payload.get("message", {}) or {}
+    contenuto = (msg.get("content") or "").strip()
+    if contenuto:
+        return contenuto
+    if (msg.get("thinking") or "").strip() or payload.get("done_reason") == "length":
+        raise RispostaVuota(f"{modello}: budget token finito nel ragionamento")
+    raise RispostaVuota(f"{modello}: risposta senza contenuto")
+
+
+def _chat_ollama(url: str, modello: str, messages: list, max_tokens: int,
+                 headers: dict = None, think: bool = None) -> str:
+    """POST su un endpoint Ollama, con ritentativo a budget allargato."""
+    budget = max(1, max_tokens)
+    ultimo = None
+    for _ in range(RITENTATIVI_OLLAMA):
+        corpo = {"model": modello, "messages": messages, "stream": False,
+                 "options": {"num_predict": budget,
+                             "temperature": _temp(), "seed": _seed()}}
+        if think is not None:
+            corpo["think"] = think
+        resp = requests.post(url, headers=headers, json=corpo, timeout=300)
+        if resp.status_code == 404:
+            # 404 da Ollama significa quasi sempre "modello non scaricato":
+            # il nudo `404 Client Error` non diceva niente all'utente.
+            raise RuntimeError(
+                f"Ollama: modello '{modello}' non disponibile ({url}). "
+                f"Scaricalo con: ollama pull {modello}")
+        resp.raise_for_status()
+        try:
+            return _testo_ollama(resp.json(), modello)
+        except RispostaVuota as e:
+            print(f"[AI] {e} — ritento con num_predict {budget * FATTORE_BUDGET}", flush=True)
+            ultimo = e
+            budget *= FATTORE_BUDGET
+    raise ultimo
+
+
 def _ollama_cloud(messages: list, max_tokens: int = 8192) -> str:
     api_key = os.environ.get("OLLAMA_API_KEY", "")
-    resp = requests.post(
-        OLLAMA_CLOUD_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": OLLAMA_CLOUD_MODEL, "messages": messages, "stream": False,
-              "think": False, "options": {"num_predict": max_tokens,
-                                          "temperature": _temp(), "seed": _seed()}},
-        timeout=300,
+    modello = os.environ.get("OLLAMA_CLOUD_MODEL", OLLAMA_CLOUD_MODEL)
+    return _chat_ollama(
+        OLLAMA_CLOUD_URL, modello, messages, max_tokens,
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"},
+        think=False,
     )
-    resp.raise_for_status()
-    msg = resp.json().get("message", {})
-    return (msg.get("content", "") or msg.get("thinking", "") or "").strip()
 
 
 def _ollama_local(messages: list, max_tokens: int = 8192) -> str:
-    model = os.environ.get("OLLAMA_LOCAL_MODEL", OLLAMA_LOCAL_MODEL)
-    resp = requests.post(
-        OLLAMA_LOCAL_URL,
-        json={"model": model, "messages": messages, "stream": False,
-              "options": {"num_predict": max_tokens,
-                          "temperature": _temp(), "seed": _seed()}},
-        timeout=300,
-    )
-    resp.raise_for_status()
-    return (resp.json().get("message", {}).get("content", "") or "").strip()
+    modello = os.environ.get("OLLAMA_LOCAL_MODEL", OLLAMA_LOCAL_MODEL)
+    return _chat_ollama(OLLAMA_LOCAL_URL, modello, messages, max_tokens)
 
 
 # ── dispatch table ────────────────────────────────────────────────────────────
@@ -332,6 +377,13 @@ def _fallback(messages: list, max_tokens: int = 4096) -> str:
     raise RuntimeError(f"Tutti i provider AI di fallback hanno fallito: {last_err}")
 
 
+def _non_vuota(testo: str) -> str:
+    """Una risposta di soli spazi non e' una risposta: meglio il fallback."""
+    if not (testo or "").strip():
+        raise RispostaVuota("risposta vuota dal provider primario")
+    return testo
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def chat(prompt: str, system: str = None, max_tokens: int = 8192) -> str:
@@ -340,7 +392,7 @@ def chat(prompt: str, system: str = None, max_tokens: int = 8192) -> str:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
     try:
-        return _primary(messages, max_tokens)
+        return _non_vuota(_primary(messages, max_tokens))
     except Exception as e:
         # provider primario giù non deve far perdere il video del giorno
         print(f"[AI] Primary failed ({e}), trying fallback...", flush=True)
@@ -364,7 +416,7 @@ def chat_with_history(system: str, history: list, user_text: str, max_tokens: in
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     try:
-        return _primary(messages, max_tokens)
+        return _non_vuota(_primary(messages, max_tokens))
     except Exception as e:
         print(f"[AI] Primary failed ({e}), trying fallback...", flush=True)
         return _fallback(messages, max_tokens)
