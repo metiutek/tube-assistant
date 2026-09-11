@@ -71,7 +71,7 @@ _check_env()
 
 from moduli.cervello import genera_topic, genera_contenuto
 from moduli.audio import genera_audio
-from moduli.asset import scarica_clips
+from moduli.asset import scarica_clips, scarica_pool_clips
 from moduli.montaggio import monta_video
 from moduli.thumbnail import genera_thumbnail
 from moduli.pubblica import pubblica_video, calcola_publish_slots
@@ -81,10 +81,15 @@ from moduli.manutenzione import (
     assicura_spazio, pulisci_cache, pulisci_temp_render, spazio_libero_gb,
 )
 from moduli.notifiche import (
-notify_start, notify_step, notify_done, notify_error, notify_analytics
+notify_start, notify_step, notify_done, notify_error, notify_analytics,
+notify_config
 )
 from moduli.telegram_handler import start_bot
 from moduli.state_io import load_state as _load_state, save_state as _save_state
+from moduli.scheduling import (
+    trigger_hours, publish_hours, PUBLISH_SPREADS,
+    TRIGGER_LEAD_HOURS, DEFAULT_TRIGGER_HOURS, DEFAULT_VIDEOS_PER_DAY,
+)
 
 AUDIO_PATH = "output/narration.mp3"
 VIDEO_PATH = "output/output_finale.mp4"
@@ -92,10 +97,6 @@ THUMB_PATH = "output/thumbnail.jpg"
 CHECKPOINT_PATH = "output/pipeline_checkpoint.json"
 PID_FILE   = ".agent.pid"
 
-DEFAULT_VIDEOS_PER_DAY = 1
-DEFAULT_TRIGGER_HOURS = [14]
-# la produzione parte 3 ore prima dell'orario di pubblicazione
-TRIGGER_LEAD_HOURS = 3
 
 _pipeline_step = "init"
 
@@ -154,35 +155,117 @@ def _spiega_errore(err: str) -> str:
     return ""
 
 
+_pid_lock_handle = None
+# byte del file di lock riservato al lock del sistema operativo: sta oltre
+# qualsiasi PID scritto all'inizio del file
+_LOCK_OFFSET = 4096
+
+
+def _prova_lock_esclusivo(fh) -> bool:
+    """Prende un lock esclusivo non bloccante sul file aperto `fh`.
+
+    Il PID da solo non basta come lock: dopo un kill duro `atexit` non gira e
+    `.agent.pid` resta orfano; se nel frattempo il sistema riassegna quel PID a
+    un processo qualsiasi, `os.kill(pid, 0)` riesce e l'avvio viene bloccato da
+    un'istanza che non esiste. Il lock invece lo tiene il sistema operativo: se
+    il processo muore — anche ammazzato — il lock cade da solo.
+
+    Su Windows il lock e' obbligatorio (non advisory) e blocca anche le
+    letture: per questo si prende un byte oltre il PID (`_LOCK_OFFSET`) invece
+    del byte 0, cosi' `cat .agent.pid` continua a funzionare.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(_LOCK_OFFSET)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+    except ImportError:
+        # nessun meccanismo di lock disponibile: si ripiega sul PID
+        return True
+
+
+def _pid_vivo(pid: int) -> bool:
+    try:
+        # signal 0 = verifica esistenza senza inviare nulla (su Windows
+        # CPython tratta a parte sig 0: non termina il processo)
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # il processo esiste ma non abbiamo i permessi per segnalarlo
+        return True
+    except (ValueError, TypeError, ProcessLookupError, OSError):
+        return False
+
+
 def _acquire_pid_lock() -> None:
     """Blocca il doppio avvio: esce se un'altra istanza è già in esecuzione."""
+    global _pid_lock_handle
+    vecchio_pid = None
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE) as f:
-                old_pid = int(f.read().strip())
-            os.kill(old_pid, 0)  # signal 0 = verifica esistenza senza inviare nulla
-            print(f"\n[ERRORE] Agent già in esecuzione (PID {old_pid}).")
-            print("Ferma l'istanza esistente prima di avviarne un'altra:")
-            print(f"  kill {old_pid}")
-            print(f"  oppure: pkill -f tube-assistant\n")
-            sys.exit(1)
-        except PermissionError:
-            # il processo esiste ma non abbiamo i permessi per segnalarlo:
-            # è comunque in esecuzione → non avviare una seconda istanza
-            print(f"\n[ERRORE] Agent già in esecuzione (PID {old_pid}).")
-            sys.exit(1)
-        except (ValueError, ProcessLookupError, OSError):
-            # PID non esiste più oppure file corrotto → rimuovi il file stale
-            os.remove(PID_FILE)
+                vecchio_pid = int(f.read().strip())
+        except (OSError, ValueError):
+            vecchio_pid = None
 
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    try:
+        fh = open(PID_FILE, "r+") if os.path.exists(PID_FILE) else open(PID_FILE, "w+")
+    except OSError as e:
+        print(f"\n[ERRORE] Impossibile aprire il file di lock {PID_FILE}: {e}\n")
+        sys.exit(1)
+
+    if not _prova_lock_esclusivo(fh):
+        fh.close()
+        print(f"\n[ERRORE] Agent già in esecuzione (PID {vecchio_pid}).")
+        print("Ferma l'istanza esistente prima di avviarne un'altra:")
+        print(f"  kill {vecchio_pid}")
+        print("  oppure: pkill -f tube-assistant")
+        sys.exit(1)
+
+    # Il lock è nostro: il contenuto precedente è di un processo morto, anche
+    # se il suo PID risulta ancora "vivo" perché nel frattempo riciclato.
+    if vecchio_pid is not None and vecchio_pid != os.getpid():
+        nota = (" (il PID risulta ancora attivo: è stato riciclato)"
+                if _pid_vivo(vecchio_pid) else "")
+        print(f"[lock] Lock orfano del PID {vecchio_pid} rimosso{nota}.", flush=True)
+
+    _pid_lock_handle = fh
+    try:
+        fh.seek(0)
+        fh.truncate(0)
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except OSError:
+        pass
 
     import atexit
     atexit.register(_release_pid_lock)
 
 
 def _release_pid_lock() -> None:
+    global _pid_lock_handle
+    fh, _pid_lock_handle = _pid_lock_handle, None
+    if fh is not None:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(_LOCK_OFFSET)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
     try:
         os.remove(PID_FILE)
     except OSError:
@@ -211,22 +294,13 @@ def _increment_runs_today(state: dict) -> None:
 
 
 def _get_trigger_hours(state: dict) -> list[int]:
-    """Return sorted list of hours when pipeline should run today.
+    """Orari UTC in cui la pipeline deve partire oggi.
 
-    Priorità: trigger espliciti > orari di pubblicazione (auto o manuali,
-    produzione TRIGGER_LEAD_HOURS prima) > default.
+    Delega a moduli.scheduling: la stessa funzione alimenta /status, /orari,
+    /prossimi e il calcolo dell'orario di pubblicazione, così il bot non può
+    più mostrare un programma diverso da quello che il daemon esegue.
     """
-    if state.get("trigger_hours_utc"):
-        hours = state["trigger_hours_utc"]
-    elif state.get("auto_scheduling") and state.get("best_hours_utc"):
-        hours = [(h - TRIGGER_LEAD_HOURS) % 24 for h in state["best_hours_utc"]]
-    elif state.get("publish_hours_utc"):
-        hours = [(h - TRIGGER_LEAD_HOURS) % 24 for h in state["publish_hours_utc"]]
-    else:
-        hours = DEFAULT_TRIGGER_HOURS
-    n = state.get("videos_per_day", DEFAULT_VIDEOS_PER_DAY)
-    # use only the first N hours
-    return sorted(hours)[:n]
+    return trigger_hours(state)
 
 
 def _should_run(state: dict, now: datetime, last_attempt: tuple | None = None) -> bool:
@@ -284,36 +358,7 @@ def _clear_checkpoint() -> None:
 
 def _scarica_tutte_le_clips(keywords: list) -> dict:
     """Scarica abbastanza clip distinte da coprire tutti i segmenti del video."""
-    clip_paths = {}
-    # quante clip distinte servono per non ripeterne nessuna nel video
-    try:
-        from moduli.montaggio import _media_duration, SEGMENT_DURATION
-        _dur = _media_duration(AUDIO_PATH)
-        target_clips = int(_dur / SEGMENT_DURATION) + 1
-    except Exception:
-        target_clips = max(len(keywords), 20)
-    # quante clip scaricare per keyword per coprire i segmenti (max 5 = limite Pexels per_page utile)
-    per_kw = max(1, min(5, -(-target_clips // max(1, len(keywords)))))
-    _log(f"  → Servono ~{target_clips} clip distinte → {per_kw} per keyword")
-
-    seen = set()
-    for i, kw in enumerate(keywords):
-        _log(f"  → [{i+1}/{len(keywords)}] Cerco: {kw} (x{per_kw})")
-        try:
-            paths = scarica_clips(kw, max_n=per_kw)
-            nuove = 0
-            for p in paths:
-                if p in seen:
-                    continue
-                seen.add(p)
-                clip_paths[f"{kw}#{nuove}"] = p
-                nuove += 1
-            _log(f"     ✓ {nuove} clip distinte")
-        except Exception as e:
-            _log(f"     ✗ Saltata: {e}")
-
-    _log(f"  → {len(clip_paths)} clip distinte scaricate (target {target_clips})")
-    return clip_paths
+    return scarica_pool_clips(keywords, AUDIO_PATH, log=_log)
 
 
 def run_pipeline(state: dict, dry_run: bool = False) -> None:
@@ -354,6 +399,7 @@ def run_pipeline(state: dict, dry_run: bool = False) -> None:
     else:
         cp = {"steps": []}
         queue = state.get("topic_queue", [])
+        dalla_coda = bool(queue)
         if queue:
             topic = queue.pop(0)
             state["topic_queue"] = queue
@@ -374,7 +420,7 @@ def run_pipeline(state: dict, dry_run: bool = False) -> None:
 
         notify_start(topic)
         _log("  → Generazione script in corso (può richiedere 30-60s)...")
-        content = genera_contenuto(topic, strategy=strategy)
+        content = genera_contenuto(topic, strategy=strategy, topic_esplicito=dalla_coda)
         cp.update({"topic": topic, "content": content, "steps": ["content"]})
         _save_checkpoint(cp)
     _log(f"  → Titolo: {content['title']}")
@@ -576,13 +622,7 @@ def _update_best_hours(state: dict, performance: list) -> None:
     # Use top-views hours; fallback to spread across day
     videos_per_day = state.get("videos_per_day", DEFAULT_VIDEOS_PER_DAY)
     # Smart defaults per slot count — production/morning/evening spread
-    spreads = {
-        1: [20],
-        2: [14, 20],
-        3: [10, 15, 20],
-        4: [9, 13, 17, 21],
-        5: [8, 11, 14, 17, 20],
-    }
+    spreads = PUBLISH_SPREADS
     scored: dict[int, list[float]] = {}
     for video in performance:
         hour = video.get("published_hour_utc")
@@ -646,7 +686,15 @@ def _cleanup_stale_state() -> None:
         changed = True
     if changed:
         _save_state(state)
-    _log(f"  Topic in coda dopo pulizia: {state.get('topic_queue', [])}")
+    # solo i primi topic: la coda intera erano 10+ righe lunghissime di rumore
+    # a ogni avvio, il conteggio completo lo stampa gia' `main()`
+    _coda = state.get("topic_queue", [])
+    if _coda:
+        _anteprima = " | ".join(t[:60] for t in _coda[:3])
+        _resto = f" (+{len(_coda) - 3} altri)" if len(_coda) > 3 else ""
+        _log(f"  Topic in coda dopo pulizia: {len(_coda)} — {_anteprima}{_resto}")
+    else:
+        _log("  Topic in coda dopo pulizia: 0")
     # manutenzione disco al boot: temp orfani + cache sotto soglia
     n_temp = pulisci_temp_render("output")
     if n_temp:
@@ -660,6 +708,42 @@ def _cleanup_stale_state() -> None:
 
 
 def main():
+    # Il daemon si ferma con Ctrl+C — lo annuncia anche la CLI. Senza questo
+    # handler l'utente si prendeva un traceback di KeyboardInterrupt invece di
+    # un'uscita pulita, sia con `python agent.py` sia con `tube-assistant start`.
+    try:
+        _main()
+    except KeyboardInterrupt:
+        # solo ASCII: l'interruzione puo' arrivare prima di forza_utf8() e su
+        # Windows con stdout cp1252 un box-drawing qui diventerebbe un
+        # UnicodeEncodeError al posto del messaggio di uscita
+        print("\n--- Agente fermato (Ctrl+C) ---", flush=True)
+        sys.exit(130)
+
+
+def _avvisa_configurazione_rotta() -> None:
+    """Preflight all'avvio: i problemi di configurazione vanno detti subito.
+
+    I controlli esistevano gia' ma solo dentro `tube-assistant preflight`, un
+    comando che nessuno lancia dopo il primo giorno. Cosi' l'API Analytics
+    spenta e' rimasta invisibile per settimane mentre la strategia continuava a
+    imparare da CTR e retention assenti.
+    """
+    try:
+        from moduli.preflight import run_checks
+        problemi = [c for c in run_checks(".") if not c["ok"]]
+    except Exception as e:
+        _log(f"  Preflight non eseguibile: {e}")
+        return
+    if not problemi:
+        return
+    righe = [f"{c['name']}: {c['detail']}" for c in problemi]
+    for riga in righe:
+        _log(f"  ⚠ {riga}")
+    notify_config(righe)
+
+
+def _main():
     from moduli.logsetup import setup as _log_su_file
     _log_su_file()
     _acquire_pid_lock()
@@ -671,6 +755,7 @@ def main():
     vpd = state.get("videos_per_day", DEFAULT_VIDEOS_PER_DAY)
     _log(f"  Video al giorno: {vpd} | Trigger: {trigger_hours} UTC")
     _log(f"  Topic in coda: {len(state.get('topic_queue', []))}")
+    _avvisa_configurazione_rotta()
 
     bot_thread = start_bot()
     bot_restarts = 0

@@ -22,23 +22,45 @@ def save_state(state: dict) -> None:
         _save(state)
 
 
+def _leggi(percorso: str) -> dict | None:
+    """Legge un file di stato e lo accetta solo se e' un oggetto JSON.
+
+    `state.json` e' una superficie di controllo modificabile a mano: un edit
+    sbagliato puo' produrre `[...]` o `null`. Restituire quel valore fa
+    esplodere il primo `state.get(...)` con AttributeError, cioe' il daemon
+    non parte piu' e l'errore non dice qual e' il problema.
+    """
+    try:
+        with open(percorso, encoding="utf-8") as f:
+            data = f.read().strip()
+    except OSError:
+        return None
+    if not data:
+        return {}
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        print(f"[state] {percorso} non contiene un oggetto JSON "
+              f"(trovato {type(parsed).__name__}): ignorato", flush=True)
+        return None
+    return parsed
+
+
 def _load() -> dict:
     if not os.path.exists(STATE_FILE):
         return {}
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            data = f.read().strip()
-        return json.loads(data) if data else {}
-    except (json.JSONDecodeError, OSError):
-        backup = f"{STATE_FILE}.bak"
-        if os.path.exists(backup):
-            try:
-                with open(backup, encoding="utf-8") as f:
-                    data = f.read().strip()
-                return json.loads(data) if data else {}
-            except Exception:
-                pass
-        return {}
+    stato = _leggi(STATE_FILE)
+    if stato is not None:
+        return stato
+    backup = f"{STATE_FILE}.bak"
+    if os.path.exists(backup):
+        stato = _leggi(backup)
+        if stato is not None:
+            print(f"[state] ripristinato da {backup}", flush=True)
+            return stato
+    return {}
 
 
 def _save(state: dict) -> None:

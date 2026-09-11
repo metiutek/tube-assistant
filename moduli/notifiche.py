@@ -80,6 +80,19 @@ def notify_error(error: str) -> None:
     _send(f"❌ <b>Errore pipeline</b>\n\n<code>{_esc(error[:500])}</code>")
 
 
+def notify_config(problemi: list) -> None:
+    """Problemi di configurazione trovati all'avvio.
+
+    Separato da `notify_error`: non e' la pipeline ad essere fallita, e
+    intestare "Errore pipeline" un'API da abilitare fa cercare il guasto nel
+    posto sbagliato.
+    """
+    if not problemi:
+        return
+    righe = "\n".join(f"• {_esc(p)}" for p in problemi[:6])
+    _send("⚠️ <b>Configurazione da sistemare</b>\n\n" + righe)
+
+
 def notify_analytics(stats: list) -> None:
     if not stats:
         _send("📊 <b>Recap analytics</b>\n\nNessun video ancora.")

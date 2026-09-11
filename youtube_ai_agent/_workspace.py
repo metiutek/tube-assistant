@@ -16,6 +16,7 @@ DEFAULT_HOME = Path.home() / ".youtube-ai-agent"
 SCAFFOLD_DIRS = [
     "output",
     "cache/pexels",
+    "cache/ai_video",
     "assets/custom/clips",
     "assets/custom/thumbnails",
     "assets/custom/audio",

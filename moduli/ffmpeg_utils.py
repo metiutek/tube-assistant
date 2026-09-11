@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import sys
 
 _CANDIDATI_FFMPEG = [
     r"C:\ffmpeg\bin\ffmpeg.exe",
@@ -43,3 +44,30 @@ def ffprobe_path() -> str:
     if shutil.which("ffprobe"):
         return "ffprobe"
     return "ffprobe"
+
+
+def esporta_per_moviepy() -> str | None:
+    """Allinea MoviePy allo stesso ffmpeg usato dalle chiamate dirette.
+
+    MoviePy legge `FFMPEG_BINARY` dall'ambiente UNA SOLA VOLTA, all'import di
+    `moviepy.config`, e i suoi reader/writer ne copiano il valore con
+    `from moviepy.config import FFMPEG_BINARY`. Assegnare l'attributo dopo
+    l'import non ha quindi alcun effetto: va impostata la variabile d'ambiente
+    PRIMA che moviepy venga importato, altrimenti MoviePy usa il binario
+    di imageio-ffmpeg e FFMPEG_PATH viene ignorato solo sul path MoviePy.
+    Ritorna il percorso impostato, oppure None se ffmpeg non e' stato trovato.
+    """
+    if "moviepy.config" in sys.modules:
+        return os.environ.get("FFMPEG_BINARY")
+    try:
+        percorso = ffmpeg_path()
+    except FileNotFoundError:
+        # niente crash all'import (es. CI senza ffmpeg): l'errore chiaro
+        # arrivera' comunque al momento del render
+        return None
+    if percorso == "ffmpeg":
+        # sul PATH: lascia decidere moviepy (auto-detect) senza path assoluto
+        os.environ.setdefault("FFMPEG_BINARY", "auto-detect")
+    else:
+        os.environ["FFMPEG_BINARY"] = percorso
+    return os.environ["FFMPEG_BINARY"]

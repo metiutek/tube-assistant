@@ -3,36 +3,18 @@ from datetime import datetime, timezone, timedelta
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from moduli.google_auth import get_credentials
-
-DEFAULT_PUBLISH_HOURS = [20]
-
-# smart publish spreads per number of videos/day
-_PUBLISH_SPREADS = {
-    1: [20],
-    2: [14, 20],
-    3: [10, 15, 20],
-    4: [9, 13, 17, 21],
-    5: [8, 11, 14, 17, 20],
-}
-
+from moduli.scheduling import (
+    prossima_pubblicazione, publish_hours, DEFAULT_PUBLISH_HOURS, PUBLISH_SPREADS,
+)
 
 def calcola_publish_slots(state: dict, run_index: int = 0) -> datetime:
-    """Return the publish datetime for the run_index-th video of today."""
-    now = datetime.now(timezone.utc)
+    """Return the publish datetime for the run_index-th video of today.
 
-    # explicit publish_hours_utc overrides everything
-    hours = state.get("publish_hours_utc")
-    if not hours and state.get("auto_scheduling"):
-        hours = state.get("best_hours_utc")
-    if not hours:
-        vpd = state.get("videos_per_day", 1)
-        hours = _PUBLISH_SPREADS.get(vpd, DEFAULT_PUBLISH_HOURS)
-
-    hour = hours[run_index % len(hours)]
-    candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
+    La risoluzione degli orari vive in moduli.scheduling, condivisa con il
+    daemon e con i comandi Telegram: prima ogni chiamante applicava priorita'
+    diverse e /orari poteva annunciare un orario che nessuno rispettava.
+    """
+    return prossima_pubblicazione(state, run_index)
 
 
 def _next_best_slot() -> datetime:
@@ -42,6 +24,57 @@ def _next_best_slot() -> datetime:
 
 def _get_youtube():
     return build("youtube", "v3", credentials=get_credentials())
+
+
+# limiti API YouTube: superarli fa fallire l'insert con HTTP 400 DOPO che il
+# video e' gia' stato renderizzato e caricato in parte. Meglio troncare.
+MAX_TITLE_CHARS = 100
+MAX_DESCRIPTION_CHARS = 5000
+MAX_TAG_CHARS = 500  # somma di tutti i tag
+UPLOAD_RETRIES = 5
+
+
+def _lingua_video() -> str:
+    """Codice lingua BCP-47 dalla preferenza utente. Prima era fisso "en"
+    anche con `lingua=italian`, quindi YouTube etichettava male il video."""
+    try:
+        from moduli.preferenze import carica
+        lingua = (carica().get("lingua") or "english").strip().lower()
+    except Exception:
+        lingua = "english"
+    return {"italian": "it", "italiano": "it"}.get(lingua, "en")
+
+
+def _tronca(testo: str, limite: int) -> str:
+    testo = (testo or "").strip()
+    if len(testo) <= limite:
+        return testo
+    # taglia sull'ultimo spazio utile per non spezzare una parola a meta'
+    tagliato = testo[:limite].rsplit(" ", 1)[0]
+    return (tagliato or testo[:limite]).rstrip(" ,;:-")
+
+
+def _snippet_valido(metadati: dict) -> dict:
+    """Titolo/descrizione/tag entro i limiti API, con `<` e `>` rimossi dal
+    titolo (YouTube rifiuta l'insert se compaiono)."""
+    title = _tronca(metadati.get("title", ""), MAX_TITLE_CHARS).replace("<", "").replace(">", "")
+    description = _tronca(metadati.get("description", ""), MAX_DESCRIPTION_CHARS)
+
+    tags, totale = [], 0
+    for tag in metadati.get("tags") or []:
+        tag = str(tag).strip()
+        if not tag:
+            continue
+        # un tag con spazi conta +2 per le virgolette implicite lato API
+        costo = len(tag) + (2 if " " in tag else 0) + 1
+        if totale + costo > MAX_TAG_CHARS:
+            break
+        tags.append(tag)
+        totale += costo
+
+    if not title:
+        raise ValueError("Titolo vuoto: impossibile pubblicare")
+    return {"title": title, "description": description, "tags": tags}
 
 
 def pubblica_video(
@@ -63,16 +96,10 @@ def pubblica_video(
     if not immediate:
         status_body["publishAt"] = publish_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    body = {
-        "snippet": {
-            "title": metadati["title"],
-            "description": metadati["description"],
-            "tags": metadati["tags"],
-            "categoryId": "28",  # Science & Technology
-            "defaultLanguage": "en",
-        },
-        "status": status_body,
-    }
+    snippet = _snippet_valido(metadati)
+    snippet["categoryId"] = os.environ.get("YOUTUBE_CATEGORY_ID", "28")  # 28 = Science & Technology
+    snippet["defaultLanguage"] = _lingua_video()
+    body = {"snippet": snippet, "status": status_body}
 
     media = MediaFileUpload(video_path, chunksize=10 * 1024 * 1024, resumable=True)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
@@ -83,7 +110,10 @@ def pubblica_video(
         print(f"Uploading video... scheduled for {publish_at.strftime('%Y-%m-%d %H:%M UTC')}")
     response = None
     while response is None:
-        status, response = request.next_chunk()
+        # num_retries: senza, un singolo blip di rete a meta' di un upload da
+        # centinaia di MB buttava via l'intera run (il checkpoint non ha ancora
+        # il video_id, quindi al riavvio si riparte dall'upload completo).
+        status, response = request.next_chunk(num_retries=UPLOAD_RETRIES)
         if status:
             print(f"  Upload {int(status.progress() * 100)}%")
 
@@ -126,12 +156,15 @@ def aggiorna_video(video_id: str, title: str = None, description: str = None,
         if not resp.get("items"):
             raise ValueError(f"Video {video_id} non trovato")
         snippet = resp["items"][0]["snippet"]
+        # stessi limiti API dell'insert: un titolo lungo qui faceva 400
         if title:
-            snippet["title"] = title
+            snippet["title"] = _tronca(title, MAX_TITLE_CHARS).replace("<", "").replace(">", "")
         if description:
-            snippet["description"] = description
+            snippet["description"] = _tronca(description, MAX_DESCRIPTION_CHARS)
         if tags is not None:
-            snippet["tags"] = tags
+            snippet["tags"] = _snippet_valido(
+                {"title": snippet["title"], "tags": tags}
+            )["tags"]
         youtube.videos().update(
             part="snippet",
             body={"id": video_id, "snippet": snippet}

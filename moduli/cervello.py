@@ -1,5 +1,6 @@
 
 import json
+import os
 import random
 import re
 from datetime import datetime
@@ -65,9 +66,14 @@ Reply with ONLY the topic as a short phrase (3-7 words). No explanation, no punc
 
 CONTENT_PROMPT = """You are a viral YouTube scriptwriter for a tech/AI channel.
 Today's date: {current_date}
-Create a complete video about: {topic}
 
-Strategy guidance:
+THE SUBJECT OF THIS VIDEO IS FIXED — it is: {topic}
+Everything you write (title, script, description, tags, keywords) must be about
+that exact subject. This is not negotiable.
+
+Strategy guidance — this shapes HOW you write, never WHAT the video is about.
+Adapt the title formula to the subject above; if the formula does not fit the
+subject, keep the subject and drop the formula.
 - Title style: {title_style}
 - Tone: {tone}
 - Hook strength: {hook_strength}
@@ -105,6 +111,150 @@ Rules:
 """
 
 
+# Ritmo di lettura usato per convertire "durata_target_minuti" in numero di
+# parole. Il valore precedente (130) sottostimava la velocita' reale di Edge
+# TTS — misurata su due script veri: 147 e 159 parole/minuto — e i video
+# uscivano circa il 18% piu' corti di quanto chiesto dall'utente.
+# Sovrascrivibile con PAROLE_AL_MINUTO per voci piu' lente o piu' veloci.
+PAROLE_AL_MINUTO_DEFAULT = 150
+
+
+def _parole_al_minuto() -> float:
+    try:
+        return max(60.0, float(os.environ.get("PAROLE_AL_MINUTO",
+                                              PAROLE_AL_MINUTO_DEFAULT)))
+    except (TypeError, ValueError):
+        return PAROLE_AL_MINUTO_DEFAULT
+
+
+# Quanto lo script puo' scostarsi dal target prima di ritentare / arrendersi.
+# La soglia buona e' il traguardo, quella minima il limite sotto cui il video
+# non vale la pena di essere prodotto.
+SOGLIA_SCRIPT_BUONA = 0.8
+SOGLIA_SCRIPT_MINIMA = 0.5
+TENTATIVI_CONTENUTO = 3
+# quante volte il tema deve comparire nello script perche' un titolo che
+# non lo nomina sia comunque accettabile
+MIN_OCCORRENZE_TEMA = 3
+
+# budget di token per il topic: i modelli reasoning ne spendono molti a
+# ragionare prima di rispondere, e con 64 restavano senza spazio per il topic
+MAX_TOKEN_TOPIC = 400
+# il prompt chiede 3-7 parole: oltre questa soglia non e' un topic ma il
+# monologo del modello ("We need to output a short phrase 3-7 words...")
+MAX_PAROLE_TOPIC = 14
+# frasi tipiche del ragionamento che non devono mai finire in un titolo
+_SPIE_RAGIONAMENTO = (
+    "we need to", "the user", "let me", "i should", "i need to", "okay,",
+    "reply with", "no punctuation", "no explanation", "as an ai",
+)
+
+
+# parole troppo comuni per dimostrare che il contenuto parla del topic
+_PAROLE_VUOTE = {
+    "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
+    "how", "why", "what", "with", "from", "that", "this", "it", "its", "ai",
+    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "del", "della",
+    "da", "per", "con", "su", "che", "e", "o", "come", "perche", "perché",
+    "dai", "ai", "agli", "alle", "nel", "sono", "essere", "oggi",
+    "degli", "dei", "delle", "dalla", "dallo", "dagli", "sulla", "sullo",
+    "nella", "nello", "negli", "nelle", "questo", "questa", "quello",
+}
+
+
+def _parole_chiave(testo: str) -> set:
+    """Parole significative di un testo, per confrontare topic e contenuto.
+
+    Separa anche sugli apostrofi: senza, l'articolo eliso italiano resta
+    attaccato ("l'evoluzione") e non combacia mai con la stessa parola scritta
+    da sola nel contenuto generato.
+    """
+    pezzi = re.split(r"[^0-9A-Za-zÀ-ÿ]+", (testo or "").lower())
+    return {p for p in pezzi if len(p) > 3} - _PAROLE_VUOTE
+
+
+def _ancore(testo: str) -> set:
+    """Token del topic che NON cambiano traducendo: sigle (LLM, GPT), nomi
+    propri (Nvidia) e numeri.
+
+    Il confronto non puo' essere sulle parole comuni: qui il topic e' spesso
+    scritto in italiano mentre il video viene generato in inglese, quindi
+    "evoluzione" non comparirebbe mai in "The Evolution of...". Le sigle e i
+    nomi propri invece restano identici in entrambe le lingue.
+    """
+    ancore = set()
+    for pezzo in re.split(r"[^0-9A-Za-zÀ-ÿ\-]+", testo or ""):
+        nudo = pezzo.strip("-")
+        if len(nudo) < 3:
+            continue
+        parte_alfabetica = re.sub(r"[^A-Za-zÀ-ÿ]", "", nudo)
+        ha_cifre = any(c.isdigit() for c in nudo)
+        e_sigla = parte_alfabetica.isupper() and len(parte_alfabetica) >= 2
+        e_nome_proprio = parte_alfabetica[:1].isupper() and not parte_alfabetica.isupper()
+        if ha_cifre or e_sigla or e_nome_proprio:
+            ancore.add(parte_alfabetica.lower() or nudo.lower())
+    return {a for a in ancore if a and a not in _PAROLE_VUOTE}
+
+
+def _prompt_senza_strategia(prompt: str) -> str:
+    """Sostituisce le righe di strategia con istruzioni neutre."""
+    neutro = {
+        "- Title style:": "- Title style: clear and descriptive, name the subject explicitly",
+        "- Tone:": "- Tone: confident and informative",
+        "- Hook strength:": "- Hook strength: medium",
+        "- Notes:": "- Notes: ignore any previous formula, write about the fixed subject above",
+    }
+    righe = []
+    for riga in prompt.splitlines():
+        sostituita = next((v for k, v in neutro.items() if riga.startswith(k)), None)
+        righe.append(sostituita if sostituita else riga)
+    return "\n".join(righe)
+
+
+def _contenuto_fuori_tema(topic: str, content: dict) -> bool:
+    """Il contenuto generato non parla affatto del topic richiesto.
+
+    Con una strategia auto-appresa aggressiva (title_style come formula
+    letterale ricavata dai video passati) il modello riscriveva il video su
+    un altro argomento: topic "L'evoluzione degli LLM" -> titolo "He Struck a
+    110mph Tennis Serve Blind". Il topic scelto dall'utente deve vincere.
+
+    Controllo volutamente permissivo: scatta solo se il topic ha ancore
+    riconoscibili e NESSUNA compare nel contenuto. Senza ancore non si giudica,
+    per non bloccare la pipeline su un falso positivo.
+    """
+    ancore = _ancore(topic)
+    if not ancore:
+        return False
+    # Contano titolo e script: sono loro a dire di cosa parla il video. Tag e
+    # keyword non bastano — il modello ci infila le parole del topic anche
+    # quando ha scritto tutt'altro (visto in produzione: titolo sul baseball
+    # con "LLM" nei tag).
+    titolo = (content.get("title") or "").lower()
+    script = (content.get("script") or "").lower()
+    if any(a in titolo for a in ancore):
+        return False
+    # titolo che non nomina il tema: si accetta solo se lo script ne parla
+    # davvero, non se lo cita di sfuggita
+    occorrenze = sum(script.count(a) for a in ancore)
+    return occorrenze < MIN_OCCORRENZE_TEMA
+
+
+def _topic_non_valido(topic: str, recent_norm: set) -> str:
+    """Ritorna il motivo dello scarto, stringa vuota se il topic va bene."""
+    t = (topic or "").strip()
+    if not t:
+        return "vuoto"
+    if len(t.split()) > MAX_PAROLE_TOPIC:
+        return f"{len(t.split())} parole, sembra il ragionamento del modello"
+    basso = t.lower()
+    if any(s in basso for s in _SPIE_RAGIONAMENTO):
+        return "contiene frasi di ragionamento"
+    if basso in recent_norm:
+        return "gia' usato di recente"
+    return ""
+
+
 def _parse_json(text: str) -> dict:
     decoder = json.JSONDecoder()
     start = text.find("{")
@@ -114,6 +264,15 @@ def _parse_json(text: str) -> dict:
         data, _ = decoder.raw_decode(text[start:])
     except json.JSONDecodeError as e:
         snippet = text[:500].replace("\n", "\\n")
+        # JSON che finisce a metà = risposta tagliata dal limite di output del
+        # provider, non un modello che sbaglia formato: dillo esplicitamente
+        if e.pos >= len(text[start:]) - 2:
+            raise ValueError(
+                "Risposta del modello troncata (JSON incompleto): lo script "
+                "richiesto non entra nel limite di output. Riduci "
+                "durata_target_minuti oppure alza AI_MAX_TOKENS nel .env. "
+                f"Dettaglio: {e}"
+            ) from e
         raise ValueError(f"Invalid JSON from model: {e}; response starts with: {snippet}") from e
     required = {"title", "description", "tags", "script", "video_keywords"}
     missing = required - set(data)
@@ -156,19 +315,151 @@ def genera_topic(strategy: dict = None, recent_topics: list = None) -> str:
         # il modello a volte avvolge il topic in virgolette nonostante il prompt
         return t.strip().strip('"“”‘’\' ')
 
-    topic = _clean(chat_ollama(prompt, max_tokens=64))
-    # se ricasca su un topic recente, ritenta una volta con nuove leve casuali
-    if topic.lower() in recent_norm:
-        print(f"[cervello] Topic duplicato '{topic}', ritento con altre leve", flush=True)
-        retry = prompt.replace(angle, random.choice(_ANGLES)).replace(subtheme, random.choice(_SUBTHEMES))
-        alt = _clean(chat_ollama(retry, max_tokens=64))
-        if alt and alt.lower() not in recent_norm:
-            topic = alt
+    def _genera(p: str) -> str:
+        # 64 token bastavano ai modelli normali ma non a quelli "reasoning",
+        # che li spendevano tutti a ragionare
+        return _clean(chat_ollama(p, max_tokens=MAX_TOKEN_TOPIC))
+
+    topic = _genera(prompt)
+    for _ in range(2):
+        motivo = _topic_non_valido(topic, recent_norm)
+        if not motivo:
+            break
+        print(f"[cervello] Topic scartato ({motivo}): {topic[:60]!r} — ritento", flush=True)
+        prompt = (prompt.replace(angle, random.choice(_ANGLES))
+                        .replace(subtheme, random.choice(_SUBTHEMES)))
+        topic = _genera(prompt)
+    if _topic_non_valido(topic, recent_norm):
+        raise ValueError(
+            f"Topic non utilizzabile dopo 3 tentativi: {topic[:120]!r}. "
+            "Il modello non rispetta il formato richiesto — prova un altro "
+            "modello (OLLAMA_CLOUD_MODEL / OPENROUTER_MODEL nel .env)."
+        )
     return topic
 
 
-def genera_contenuto(topic: str, strategy: dict = None) -> dict:
+def _strategia_neutra(strategy: dict) -> dict:
+    """Tiene tono e ritmo, scarta cio' che detta l'ARGOMENTO.
+
+    La strategia viene appresa dalle performance passate e su un canale con
+    pochi dati degenera in una formula letterale (`title_style` del tipo
+    "[Human] Achieved [Metric] — AI Gave Them [Ability]"). Il modello la
+    segue alla lettera e riscrive il video su quell'argomento, ignorando il
+    topic. Quando il topic lo ha scelto l'utente, deve vincere lui.
+    """
+    neutra = dict(strategy or {})
+    neutra["title_style"] = ("clear and descriptive — the title must name the "
+                             "subject of this video explicitly")
+    neutra["notes"] = ("Write about the fixed subject above. Ignore any formula "
+                       "or topic pattern learned from previous videos.")
+    neutra.pop("topic_focus", None)
+    neutra.pop("avoid_patterns", None)
+    return neutra
+
+
+CONTINUA_PROMPT = """You are continuing the narration script of a YouTube video.
+
+Video subject: {topic}
+Language: {language}
+
+The script so far ends with these words:
+...{coda}
+
+Write ONLY the CONTINUATION — about {mancanti} more words — so the finished
+script reaches roughly {target_words} words ({target_minutes} minutes of
+narration).
+
+Rules:
+- Start exactly where the text above stops. Do not repeat it, do not summarise it.
+- Do not restart the video, do not greet the viewer again.
+- Flowing spoken prose, same voice and tone. No headings, no bullet points,
+  no stage directions, no JSON, no quotes around the text.
+- Add real substance: concrete examples, numbers, causes and consequences,
+  objections and answers, then a proper closing with a call to action.
+- Reply with the continuation text and nothing else."""
+
+# quante parole della fine dello script si mostrano al modello per fargli
+# riprendere il discorso senza rileggerlo tutto
+_CODA_PAROLE = 90
+MAX_CONTINUAZIONI = 2
+
+
+def _ripulisci_continuazione(testo: str) -> str:
+    """Toglie dalla continuazione tutto cio' che non e' narrazione.
+
+    Il modello a volte incornicia la risposta ("Here is the continuation:",
+    blocchi ```), e quel testo finirebbe letto ad alta voce dal TTS.
+    """
+    testo = (testo or "").strip()
+    testo = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", testo).strip()
+    righe = []
+    for i, riga in enumerate(testo.splitlines()):
+        pulita = riga.strip()
+        if pulita.startswith("#"):
+            continue
+        # riga introduttiva del tipo "Continuation:" solo se e' la prima
+        if i == 0 and pulita.endswith(":") and len(pulita.split()) <= 8:
+            continue
+        righe.append(pulita)
+    return " ".join(r for r in righe if r).strip()
+
+
+def _allunga_script(content: dict, topic: str, target_words: int,
+                    soglia: int, language: str, target_minutes) -> dict:
+    """Chiede al modello di CONTINUARE lo script finche' non arriva a target.
+
+    Rigenerare l'intero JSON per uno script corto costa una chiamata piena e
+    di solito restituisce un testo altrettanto corto: il modello "sente" quella
+    lunghezza come completa. Continuare invece funziona, perche' il compito
+    cambia — non "scrivi 1200 parole" ma "aggiungine altre 400".
+    """
+    script = (content.get("script") or "").strip()
+    if not script:
+        return content
+    for _ in range(MAX_CONTINUAZIONI):
+        parole = len(script.split())
+        if parole >= soglia:
+            break
+        mancanti = max(target_words - parole, 80)
+        prompt = CONTINUA_PROMPT.format(
+            topic=topic,
+            language=language,
+            coda=" ".join(script.split()[-_CODA_PAROLE:]),
+            mancanti=mancanti,
+            target_words=target_words,
+            target_minutes=target_minutes,
+        )
+        try:
+            # ~2 token per parola, piu' margine per i modelli che ragionano
+            aggiunta = _ripulisci_continuazione(
+                chat_ollama(prompt, max_tokens=min(8192, mancanti * 2 + 600)))
+        except Exception as e:
+            print(f"[cervello] Continuazione fallita: {e}", flush=True)
+            break
+        nuove = len(aggiunta.split())
+        # un modello che ignora "solo testo" e rispedisce il JSON del video
+        # farebbe leggere al TTS le graffe e i nomi dei campi
+        if aggiunta.lstrip().startswith("{") or '"script"' in aggiunta:
+            print("[cervello] Continuazione scartata: il modello ha "
+                  "risposto in JSON invece che in prosa", flush=True)
+            break
+        if nuove < 40:
+            print(f"[cervello] Continuazione inutilizzabile ({nuove} parole)", flush=True)
+            break
+        script = f"{script} {aggiunta}".strip()
+        print(f"[cervello] Script allungato: +{nuove} parole -> "
+              f"{len(script.split())} (soglia {soglia})", flush=True)
+    esteso = dict(content)
+    esteso["script"] = script
+    return esteso
+
+
+def genera_contenuto(topic: str, strategy: dict = None,
+                     topic_esplicito: bool = False) -> dict:
     strategy = strategy or {}
+    if topic_esplicito:
+        # topic scelto dall'utente: la strategia non puo' cambiargli argomento
+        strategy = _strategia_neutra(strategy)
     try:
         from moduli.preferenze import carica
         pref = carica()
@@ -176,7 +467,7 @@ def genera_contenuto(topic: str, strategy: dict = None) -> dict:
         pref = {}
     target_minutes = pref.get("durata_target_minuti", 8)
     language = pref.get("lingua", "english") or "english"
-    target_words = int(target_minutes * 130)  # ~130 parole/min a velocità TTS normale
+    target_words = int(target_minutes * _parole_al_minuto())
     prompt = CONTENT_PROMPT.format(
         current_date=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z"),
         topic=topic,
@@ -190,19 +481,77 @@ def genera_contenuto(topic: str, strategy: dict = None) -> dict:
     )
     # uno script troppo corto produce un video di pochi secondi: meglio
     # ritentare una volta e poi fallire con un errore chiaro che pubblicarlo
-    min_words = max(150, int(target_words * 0.5))
+    # Gli LLM contano male le parole e tendono a stare sotto il target: con la
+    # soglia al 50% un video "da 8 minuti" ne durava tranquillamente 4
+    # (misurato: 433 parole invece di 600, video 2.7 min invece di 4).
+    # Si ritenta puntando alla soglia buona; solo se tutti i tentativi
+    # falliscono si tiene lo script piu' lungo ottenuto — meglio un video
+    # corto che nessun video.
+    soglia_buona = max(150, int(target_words * SOGLIA_SCRIPT_BUONA))
+    soglia_minima = max(120, int(target_words * SOGLIA_SCRIPT_MINIMA))
+    migliore = None
     last_err = None
-    for attempt in range(2):
+    correzione = ""  # feedback sul tentativo precedente, vuoto al primo giro
+    for attempt in range(TENTATIVI_CONTENUTO):
         try:
-            content = _parse_json(chat_ollama(prompt, max_tokens=8192))
-            words = len(content.get("script", "").split())
-            if words < min_words:
+            content = _parse_json(chat_ollama(prompt + correzione, max_tokens=8192))
+            if _contenuto_fuori_tema(topic, content):
+                # La strategia auto-appresa sta imponendo il suo argomento:
+                # per i tentativi successivi la si neutralizza, perche' un
+                # topic scelto dall'utente vale piu' di una formula ricavata
+                # dalle performance passate.
+                prompt = _prompt_senza_strategia(prompt)
                 raise ValueError(
-                    f"Script troppo corto: {words} parole, minimo {min_words} "
-                    f"per un video da ~{target_minutes} minuti"
+                    f"Il contenuto non parla del topic richiesto: titolo "
+                    f"{content.get('title', '')!r} per topic {topic!r}"
                 )
-            return content
+            words = len(content.get("script", "").split())
+            if words < soglia_buona:
+                # Prima di buttare via tutto e rigenerare l'intero JSON, si
+                # chiede al modello di CONTINUARE lo script: rigenerare da capo
+                # riproduce quasi sempre la stessa lunghezza (misurato: 742 →
+                # 646 → 696 su target 1200), mentre una continuazione parte da
+                # cio' che c'e' gia' e aggiunge solo quello che manca.
+                content = _allunga_script(content, topic, target_words,
+                                          soglia_buona, language, target_minutes)
+                words = len(content.get("script", "").split())
+            if words >= soglia_buona:
+                return content
+            if migliore is None or words > len(migliore.get("script", "").split()):
+                migliore = content
+            # Ritentare con lo STESSO prompt non serviva a niente: il modello
+            # riproduceva la stessa lunghezza (misurato: 742 → 646 → 696 parole
+            # su un target di 1200). Ora il tentativo successivo sa quanto è
+            # stato corto e di quanto deve allungare.
+            mancanti = max(soglia_buona - words, 0)
+            correzione = (
+                f"\n\nRETRY — YOUR PREVIOUS ATTEMPT FAILED.\n"
+                f"The \"script\" field contained only {words} words. That is far "
+                f"too short for a {target_minutes}-minute video.\n"
+                f"This attempt MUST contain AT LEAST {soglia_buona} words in "
+                f"\"script\" (about {mancanti} words more than last time), "
+                f"ideally {target_words}.\n"
+                f"Do not summarise. Expand with concrete detail: real examples, "
+                f"numbers, causes, consequences, objections and answers, a longer "
+                f"opening hook and a proper closing. Keep it flowing prose, same "
+                f"topic, same JSON structure."
+            )
+            last_err = ValueError(
+                f"Script corto: {words} parole invece di ~{target_words} "
+                f"per un video da {target_minutes} minuti"
+            )
+            print(f"[cervello] {last_err} (tentativo {attempt + 1}/"
+                  f"{TENTATIVI_CONTENUTO})", flush=True)
         except ValueError as e:
             last_err = e
-            print(f"[cervello] Contenuto non valido (tentativo {attempt + 1}/2): {e}", flush=True)
+            print(f"[cervello] Contenuto non valido (tentativo {attempt + 1}/"
+                  f"{TENTATIVI_CONTENUTO}): {e}", flush=True)
+
+    if migliore is not None:
+        parole = len(migliore.get("script", "").split())
+        if parole >= soglia_minima:
+            print(f"[cervello] Nessun tentativo ha raggiunto {soglia_buona} parole: "
+                  f"uso il piu' lungo ({parole}, ~{parole / _parole_al_minuto():.1f} "
+                  f"min invece di {target_minutes})", flush=True)
+            return migliore
     raise last_err

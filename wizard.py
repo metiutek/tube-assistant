@@ -151,7 +151,7 @@ def err(msg: str):  console.print(f"  [bold red]✗[/]  {msg}")
 
 def step_agent_language() -> None:
     console.clear()
-    header("Step 1 / 6 — Agent Language", "What language should your Telegram assistant speak?")
+    header("Step 1 / 7 — Agent Language", "What language should your Telegram assistant speak?")
 
     console.print("  [dim]Type any language: English, Italiano, Español, Français, Deutsch…[/]")
     console.print()
@@ -275,7 +275,7 @@ def _test_gemini(key: str) -> tuple[bool, str]:
 
 def step_ai_service() -> None:
     console.clear()
-    header("Step 2 / 6 — AI Service", "Choose which AI powers the agent")
+    header("Step 2 / 7 — AI Service", "Choose which AI powers the agent")
 
     table = Table(show_header=True, header_style="bold cyan", border_style="dim")
     table.add_column("#", width=3)
@@ -416,7 +416,7 @@ def _test_hf_key(key: str) -> tuple[bool, str]:
 
 def step_image_provider() -> None:
     console.clear()
-    header("Step 3 / 6 — Thumbnail Image Generation",
+    header("Step 3 / 7 — Thumbnail Image Generation",
            "Choose how to generate your video thumbnails")
 
     console.print("  [bold]Available providers:[/]\n")
@@ -474,13 +474,36 @@ def step_image_provider() -> None:
 
 def step_pexels() -> None:
     console.clear()
-    header("Step 4 / 6 — Pexels API", "Free stock video clips for your videos")
+    header("Step 4 / 7 — Pexels API", "Free stock video clips for your videos")
     info("Create a free account and get a key at: [link]https://www.pexels.com/api/[/]")
+    info("Serve comunque: e' la rete di sicurezza anche se generi le clip con l'AI.")
     console.print()
     key = Prompt.ask("[bold]Pexels API key[/]")
     write_env_key("PEXELS_API_KEY", key)
     console.print()
     ok("Pexels key saved")
+    console.print()
+    Prompt.ask("[dim]Press Enter to continue[/]", default="")
+
+
+# ── step 2d — sorgente clip (stock o AI video) ────────────────────────────────
+
+def step_sorgente_clip() -> None:
+    """Stock, AI generativa o le due insieme.
+
+    Sta dopo Pexels di proposito: qualunque cosa scelga l'utente, la chiave
+    Pexels resta la rete di sicurezza quando il provider AI e' giu' o senza
+    credito, e chiederla dopo aver appena configurato l'AI sembrerebbe un
+    passaggio inutile da saltare.
+    """
+    from moduli import impostazioni_video
+
+    def _intestazione() -> None:
+        console.clear()
+        header("Step 5 / 7 — Sorgente delle clip",
+               "Clip stock da Pexels, generate da un'AI video, o entrambe")
+
+    impostazioni_video.configura(console, workspace=".", intestazione=_intestazione)
     console.print()
     Prompt.ask("[dim]Press Enter to continue[/]", default="")
 
@@ -528,7 +551,7 @@ def _register_bot_commands(token: str) -> bool:
 
 def step_telegram_token() -> str:
     console.clear()
-    header("Step 5 / 6 — Telegram Bot", "Your live control interface")
+    header("Step 6 / 7 — Telegram Bot", "Your live control interface")
 
     console.print("  [bold]How to create a bot:[/]")
     console.print("  1. Open Telegram and start a chat with [cyan]@BotFather[/]")
@@ -739,7 +762,7 @@ async def run_onboarding(token: str) -> dict:
 
 def step_telegram_onboarding(token: str) -> dict:
     console.clear()
-    header("Step 6 / 6 — Channel Setup via Telegram", "Your AI agent will interview you")
+    header("Step 7 / 7 — Channel Setup via Telegram", "Your AI agent will interview you")
 
     console.print(Panel(
         "[bold cyan]Open your Telegram bot and send /start[/]\n\n"
@@ -810,7 +833,7 @@ def main() -> None:
             "[bold cyan]YouTube AI Agent[/]\n"
             "[bold]Setup Wizard[/]\n\n"
             "[dim]Autonomous video pipeline: script → TTS → clips → montage → upload[/]\n\n"
-            "[dim]This wizard configures everything in 5 steps.[/]"
+            "[dim]This wizard configures everything in 7 steps.[/]"
         ),
         border_style="cyan",
         padding=(2, 8),
@@ -834,6 +857,7 @@ def main() -> None:
     step_ai_service()
     step_image_provider()
     step_pexels()
+    step_sorgente_clip()
     token = step_telegram_token()
     data  = step_telegram_onboarding(token)
     save_results(data)
@@ -857,6 +881,8 @@ def main() -> None:
     env_vals = dict(dotenv_values(ENV_FILE))
     table.add_row("AI Service",      env_vals.get("AI_SERVICE", "—"))
     table.add_row("Image Provider",  env_vals.get("IMAGE_PROVIDER", "pollinations"))
+    from moduli.impostazioni_video import stato as _stato_clip
+    table.add_row("Clip video",      _stato_clip("."))
     table.add_row("Language",        data.get("language", "english"))
     table.add_row("Channel",         data.get("channel_name", "—"))
     table.add_row("Credentials",     "✓ saved" if Path(CREDS_FILE).exists() else "✗ not found")

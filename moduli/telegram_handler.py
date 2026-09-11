@@ -285,8 +285,8 @@ def _ask_ai(user_text: str, history: list, state: dict) -> tuple[str, list]:
 
     queue = state.get("topic_queue", [])
     recent = state.get("recent_topics", [])
-    publish_hours = state.get("publish_hours_utc", [20])
-    trigger_hours = [(h - 3) % 24 for h in publish_hours]
+    ore_publish = publish_hours(state)
+    ore_trigger = trigger_hours(state)
     vpd = state.get("videos_per_day", 1)
     video_ids = state.get("video_ids", [])
     video_links = ", ".join(f"https://youtu.be/{v}" for v in video_ids[:5]) if video_ids else "nessuno"
@@ -305,7 +305,7 @@ def _ask_ai(user_text: str, history: list, state: dict) -> tuple[str, list]:
         f"[CONTESTO ATTUALE — {_data_str}, ore {_ora_locale.strftime('%H:%M')} ({_tz_str}; "
         f"{datetime.now(timezone.utc).strftime('%H:%M')} UTC)]\n"
         f"IMPORTANTE: per data e ora usa SEMPRE ed ESATTAMENTE i valori qui sopra. Non calcolarli, non inventarli.\n"
-        f"Video al giorno: {vpd} | Pipeline automatica: {trigger_hours} UTC | Pubblica: {publish_hours} UTC\n"
+        f"Video al giorno: {vpd} | Pipeline automatica: {ore_trigger} UTC | Pubblica: {ore_publish} UTC\n"
         f"Topic in coda ({len(queue)}):\n{chr(10).join(f'  {i+1}. {t}' for i, t in enumerate(queue)) if queue else '  nessuno'}\n"
         f"IMPORTANTE: quando l'utente dice 'fai topic N' o 'crea il topic N', usa ESATTAMENTE il testo del topic numero N dalla lista sopra nel tag [FORZA_ORA: testo esatto].\n"
         f"Ultimi topic prodotti: {', '.join(recent[:5]) if recent else 'nessuno'}\n"
@@ -611,16 +611,15 @@ def _execute_actions(reply: str, state: dict, is_search: bool = False,
     return clean.strip(), added_topics, saved_memories, removed_memories, api_results, deferred_tasks
 
 from moduli.state_io import load_state as _load_state, save_state as _save_state
+from moduli.scheduling import publish_hours, trigger_hours, PUBLISH_SPREADS
 
 
 def _publish_hours(state: dict) -> list[int]:
-    vpd = state.get("videos_per_day", 1)
-    hours = state.get("publish_hours_utc") or [20]
-    return sorted(hours)[:vpd]
+    return publish_hours(state)
 
 
 def _trigger_hours(state: dict) -> list[int]:
-    return sorted((h - 3) % 24 for h in _publish_hours(state))
+    return trigger_hours(state)
 
 
 def _next_schedule(state: dict):
@@ -629,7 +628,7 @@ def _next_schedule(state: dict):
     if done >= state.get("videos_per_day", 1):
         now = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     publish = _publish_hours(state)
-    trigger = [(h - 3) % 24 for h in publish]
+    trigger = _trigger_hours(state)
     upcoming = []
     for idx, (trigger_hour, publish_hour) in enumerate(zip(trigger, publish)):
         trigger_dt = now.replace(hour=trigger_hour, minute=0, second=0, microsecond=0)
@@ -700,12 +699,21 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             attivita = "⏳ In attesa — nessun orario configurato"
 
+    # sorgente clip: con la generazione AI attiva ogni run costa, e va detto
+    # dove si guarda lo stato, non solo nella TUI
+    try:
+        from moduli.video_ai import riassunto as _riassunto_clip
+        riga_clip = f"🎞 Clip: {_h(_riassunto_clip())}\n"
+    except Exception:
+        riga_clip = ""
+
     msg = (
         f"📡 <b>Status Agent</b>\n\n"
         f"{attivita}\n\n"
         f"🗓 Ultimo run: {last}\n"
         f"📋 Topic in coda: {len(queue)}\n"
         f"📹 Video prodotti: {len(state.get('video_ids', []))}\n"
+        f"{riga_clip}"
     )
     if last_video:
         msg += f"🔗 Ultimo: https://youtu.be/{last_video}\n"
@@ -857,7 +865,7 @@ async def cmd_setvideogiorno(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Numero non valido. Usa un valore tra 1 e 5.")
         return
 
-    publish_spreads = {1: [20], 2: [14, 20], 3: [10, 15, 20], 4: [9, 13, 17, 21], 5: [8, 11, 14, 17, 20]}
+    publish_spreads = PUBLISH_SPREADS
 
     state = _load_state()
     state["videos_per_day"] = n
@@ -865,9 +873,10 @@ async def cmd_setvideogiorno(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     state.pop("trigger_hours_utc", None)
     _save_state(state)
 
-    trigger_ore = [(h - 3) % 24 for h in publish_spreads[n]]
-    trigger_str = ", ".join(f"{h:02d}:00" for h in trigger_ore)
-    publish_str = ", ".join(f"{h:02d}:00" for h in publish_spreads[n])
+    # orari effettivi dal resolver condiviso: con auto_scheduling attivo
+    # possono differire dallo spread appena scritto
+    trigger_str = ", ".join(f"{h:02d}:00" for h in _trigger_hours(state))
+    publish_str = ", ".join(f"{h:02d}:00" for h in _publish_hours(state))
     await update.message.reply_text(
         f"✅ <b>{n} video al giorno</b>\n\n"
         f"🎬 Pipeline automatica: {trigger_str} UTC\n"
@@ -899,7 +908,7 @@ async def cmd_orari(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = _load_state()
     vpd = state.get("videos_per_day", 1)
     publish = _publish_hours(state)
-    trigger = [(h - 3) % 24 for h in publish]
+    trigger = _trigger_hours(state)
     auto = state.get("auto_scheduling", False)
     done = state.get("runs_today", {}).get(
         datetime.now(timezone.utc).strftime("%Y-%m-%d"), 0
@@ -964,12 +973,26 @@ async def cmd_setpubblica(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     state["publish_hours_utc"] = ore
     # cancella trigger_hours_utc espliciti: la produzione deriva sempre dalla pubblicazione
     state.pop("trigger_hours_utc", None)
+    # scelta manuale esplicita: spegne l'auto-scheduling, che altrimenti
+    # continuerebbe a produrre su best_hours_utc rendendo falso il messaggio qui sotto
+    era_auto = bool(state.pop("auto_scheduling", False))
     _save_state(state)
-    trigger_ore = [(o - 3) % 24 for o in ore]
+    richiesti = len(ore)
+    ore = _publish_hours(state)
+    trigger_ore = _trigger_hours(state)
     lines = [f"  Video {i+1}: produzione alle <b>{t:02d}:00</b>, pubblicazione alle <b>{p:02d}:00</b> UTC"
              for i, (t, p) in enumerate(zip(trigger_ore, ore))]
+    nota = ("\n\n🤖 Auto-scheduling disattivato: valgono questi orari manuali. "
+            "Riattivalo con <code>/autoscheduling on</code>." if era_auto else "")
+    # gli orari oltre videos_per_day vengono scartati: senza avviso l'utente
+    # imposta due pubblicazioni e ne vede una sola, senza capire perche'
+    if richiesti > len(ore):
+        nota += (f"\n\n⚠️ Hai indicato {richiesti} orari ma produci "
+                 f"{state.get('videos_per_day', 1)} video al giorno: uso solo "
+                 f"{'il primo' if len(ore) == 1 else f'i primi {len(ore)}'}. "
+                 f"Per usarli tutti: <code>/setvideogiorno {richiesti}</code>.")
     await update.message.reply_text(
-        "✅ Orari aggiornati:\n" + "\n".join(lines),
+        "✅ Orari aggiornati:\n" + "\n".join(lines) + nota,
         parse_mode="HTML"
     )
 
@@ -1575,8 +1598,25 @@ def start_bot() -> threading.Thread | None:
             os._exit(1)
         print("[Telegram] Bot polling started")
 
+        # Sorveglia il polling invece di dormire e basta: con `sleep(3600)` il
+        # thread restava vivo anche a updater morto, quindi il watchdog di
+        # agent.py (che guarda `is_alive()`) non lo riavviava mai.
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(30)
+            updater = getattr(app, "updater", None)
+            if updater is not None and not updater.running:
+                print("[Telegram] Polling non piu' attivo — chiudo il thread "
+                      "per farlo riavviare dal watchdog", flush=True)
+                break
+        try:
+            await app.updater.stop()
+        except Exception:
+            pass
+        try:
+            await app.stop()
+            await app.shutdown()
+        except Exception:
+            pass
 
     def _thread():
         try:

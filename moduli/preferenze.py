@@ -78,12 +78,51 @@ def aggiorna(chiave: str, valore) -> dict:
     return pref
 
 
+# Una domanda non e' mai un comando di impostazione. Senza questo filtro
+# "che lingua parla il canale?" salvava lingua="parla il canale?" e il
+# messaggio non arrivava nemmeno all'AI (handle_message fa early-return).
+_INTERROGATIVI = (
+    "che ", "cosa ", "quale", "quali", "come ", "quando", "perche", "perché",
+    "chi ", "dove", "quanto", "quanti", "mi dici", "dimmi",
+    "what ", "which", "how ", "when ", "why ", "who ", "where ",
+)
+# verbi che indicano davvero la volonta' di cambiare un'impostazione
+_VERBI_IMPOSTAZIONE = re.compile(
+    r"\b(?:imposta|setta|metti|cambia|modifica|usa|adotta|voglio|vorrei|preferisco|"
+    r"d'ora\s+in\s+poi|da\s+ora|sempre|set|change|update|use|switch)\b",
+    re.IGNORECASE,
+)
+# verbi di generazione one-shot: "genera una copertina di prova" non deve
+# scrivere stile_thumbnail="di prova"
+_VERBI_GENERAZIONE = re.compile(
+    r"\b(?:genera|generami|crea|creami|fai|fammi|mostrami|mostra|scrivi|produci|"
+    r"inviami|mandami|generate|create|make|show|send)\b",
+    re.IGNORECASE,
+)
+
+
+def _e_domanda(testo: str) -> bool:
+    t = testo.strip().lower()
+    return t.endswith("?") or t.startswith(_INTERROGATIVI)
+
+
 def aggiorna_da_testo(testo: str) -> dict:
-    """Aggiorna preferenze da frasi naturali e restituisce solo le modifiche."""
+    """Aggiorna preferenze da frasi naturali e restituisce solo le modifiche.
+
+    Il parsing e' volutamente conservativo: nel dubbio non tocca nulla e lascia
+    decidere all'LLM, che ha comunque il tag [SETPREF: chiave=valore]. Un falso
+    positivo qui e' peggio di un mancato match, perche' salva una preferenza
+    sbagliata E impedisce alla domanda di raggiungere l'AI.
+    """
     pref = carica()
     original = testo.strip()
     t = original.lower()
     modifiche = {}
+
+    if _e_domanda(original):
+        return modifiche
+    _vuole_impostare = bool(_VERBI_IMPOSTAZIONE.search(original))
+    _vuole_generare = bool(_VERBI_GENERAZIONE.search(original))
 
     def set_pref(chiave: str, valore, merge_list: bool = False) -> None:
         nuovo = _converti_valore(chiave, valore)
@@ -105,10 +144,13 @@ def aggiorna_da_testo(testo: str) -> dict:
         "musica_volume": ("musica_volume", "musica volume", "volume musica"),
         "note_libere": ("note_libere", "note libere"),
     }
+    # separatore `=` o `:` OBBLIGATORIO: senza, qualsiasi frase che contenesse
+    # la parola chiave ("...la lingua parla...") finiva salvata come valore.
+    # Le forme in linguaggio naturale sono coperte dai pattern specifici sotto.
     for chiave, aliases in alias_espliciti.items():
         for alias in aliases:
-            match = re.search(rf"\b{re.escape(alias)}\b\s*(?:=|:)?\s+(.+)", original, re.IGNORECASE)
-            if match:
+            match = re.search(rf"\b{re.escape(alias)}\b\s*[=:]\s*(.+)", original, re.IGNORECASE)
+            if match and match.group(1).strip():
                 set_pref(chiave, match.group(1))
                 break
 
@@ -152,14 +194,20 @@ def aggiorna_da_testo(testo: str) -> dict:
         re.IGNORECASE,
     )
     if evita_match:
-        valore = re.sub(r"^(?:argomenti\s+)?(?:come\s+)?", "", evita_match.group(1).strip(), flags=re.IGNORECASE)
+        valore = re.sub(r"^(?:argomenti\s+)?(?:come\s+)?(?:di\s+|su\s+|sul\s+|sulla\s+|about\s+)?",
+                        "", evita_match.group(1).strip(), flags=re.IGNORECASE)
         set_pref("argomenti_evitare", valore, merge_list=True)
 
     preferiti_match = re.search(r"\b(?:argomenti\s+preferiti|parla\s+di|voglio\s+argomenti\s+su)\b\s*(.+)", original, re.IGNORECASE)
-    if preferiti_match and "non " not in t:
+    if preferiti_match and "non " not in t and not _vuole_generare:
         set_pref("argomenti_preferiti", preferiti_match.group(1), merge_list=True)
 
-    thumb_match = re.search(r"\b(?:stile\s+thumbnail|thumbnail|copertina)\b\s*(?:=|:|con|in|stile)?\s*(.+)", original, re.IGNORECASE)
+    # "stile thumbnail X" e' esplicito; il solo "thumbnail/copertina" richiede
+    # un verbo di impostazione e nessun verbo di generazione, altrimenti
+    # "genera una copertina di prova" salvava stile_thumbnail="di prova"
+    thumb_match = re.search(r"\bstile\s+(?:thumbnail|copertina)\b\s*(?:=|:|con|in)?\s*(.+)", original, re.IGNORECASE)
+    if not thumb_match and _vuole_impostare and not _vuole_generare:
+        thumb_match = re.search(r"\b(?:thumbnail|copertina)\b\s*(?:=|:|con|in|stile)?\s*(.+)", original, re.IGNORECASE)
     if thumb_match:
         value = thumb_match.group(1).strip(" .")
         # non confondere comandi sul TESTO (colore/grandezza/posizione) con lo stile immagine
@@ -170,8 +218,8 @@ def aggiorna_da_testo(testo: str) -> dict:
         if value and not _is_text_cmd:
             set_pref("stile_thumbnail", value)
 
-    note_match = re.search(r"\b(?:nota|ricorda\s+per\s+i\s+video|preferenza\s+generale)\b\s*[:\-]?\s*(.+)", original, re.IGNORECASE)
-    if note_match:
+    note_match = re.search(r"\b(?:nota|ricorda\s+per\s+i\s+video|preferenza\s+generale)\b\s*[:\-]\s*(.+)", original, re.IGNORECASE)
+    if note_match and not _vuole_generare:
         set_pref("note_libere", note_match.group(1))
 
     _COLORI_IT = {

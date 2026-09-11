@@ -31,6 +31,7 @@ Previous strategies tried (most recent first):
 
 User preferences (HARD CONSTRAINTS — never violate):
 {preferences}
+{metriche_nota}
 
 Produce an EVOLVED strategy that:
 - Learns from what's working and what isn't (CTR, retention, views)
@@ -55,6 +56,9 @@ Rules:
 - Views < 100 on 3+ videos in a row: pivot topic category entirely, not just title tweaks
 - If top performers share a topic pattern: that's the direction to pursue
 - If a past strategy led to measurable improvement: continue that trajectory
+- NEVER copy a previous strategy from the history word for word: this run must
+  produce new wording and at least one new, concrete decision. The history is
+  context to build on, not an answer to repeat.
 - Reply ONLY with JSON, no explanation outside JSON.
 """
 
@@ -82,20 +86,37 @@ def _score_video(v: dict) -> float:
     return views * 0.4 + ctr * 30 + retention * 2
 
 
-def _perf_snapshot(videos: list[dict]) -> list[dict]:
-    return [
-        {
+def _analytics_mancanti(videos: list[dict]) -> bool:
+    """True se le metriche Analytics non sono disponibili per nessun video.
+
+    Con l'API Analytics spenta arrivavano CTR e retention a 0, e il modello li
+    leggeva come dati reali ("zero CTR su tutti i video, cambia i titoli"):
+    decisioni editoriali prese su numeri che non esistono.
+    """
+    return bool(videos) and all(v.get("analytics_disponibili") is False for v in videos)
+
+
+def _perf_snapshot(videos: list[dict], con_analytics: bool = True) -> list[dict]:
+    snapshot = []
+    for v in videos:
+        riga = {
             "title": v.get("title", "")[:60],
             "views": v.get("views", 0),
-            "ctr_pct": round(float(v.get("ctr_percent") or 0), 2),
-            "retention_pct": round(
+            "likes": v.get("likes", 0),
+            "comments": v.get("comments", 0),
+        }
+        if con_analytics:
+            riga["ctr_pct"] = round(float(v.get("ctr_percent") or 0), 2)
+            riga["retention_pct"] = round(
                 float(v.get("avg_view_duration_seconds") or 0) /
                 max(float(v.get("duration_seconds") or 1), 1.0) * 100, 1
-            ),
-            "score": round(_score_video(v), 1),
-        }
-        for v in videos
-    ]
+            )
+        else:
+            riga["ctr_pct"] = "unavailable"
+            riga["retention_pct"] = "unavailable"
+        riga["score"] = round(_score_video(v), 1)
+        snapshot.append(riga)
+    return snapshot
 
 
 def calcola_strategia(performance: list[dict]) -> dict:
@@ -104,17 +125,28 @@ def calcola_strategia(performance: list[dict]) -> dict:
         return {**DEFAULT_STRATEGY, "topic_focus": ", ".join(pref.get("argomenti_preferiti", []))}
     history = _load_history()
 
+    con_analytics = not _analytics_mancanti(performance)
     scored = sorted(performance, key=_score_video, reverse=True)
-    top = _perf_snapshot(scored[:3])
-    bottom = _perf_snapshot(scored[-3:]) if len(scored) > 3 else []
+    top = _perf_snapshot(scored[:3], con_analytics)
+    bottom = _perf_snapshot(scored[-3:], con_analytics) if len(scored) > 3 else []
 
     try:
         prompt = STRATEGY_PROMPT.format(
-            performance_json=json.dumps(_perf_snapshot(performance), indent=2),
+            performance_json=json.dumps(_perf_snapshot(performance, con_analytics), indent=2),
             top_performers=json.dumps(top, indent=2),
             underperformers=json.dumps(bottom, indent=2),
             history_json=json.dumps(history[-5:], indent=2) if history else "[]",
             preferences=json.dumps(pref, indent=2, ensure_ascii=False),
+            metriche_nota=(
+                "" if con_analytics else
+                "\nIMPORTANT: CTR, impressions and retention are marked "
+                "\"unavailable\" — the YouTube Analytics API is not enabled for "
+                "this channel. Treat them as UNKNOWN, never as zero. Base your "
+                "reasoning only on views, likes, comments and titles, and do not "
+                "claim CTR or retention is low. Some strategies in the history "
+                "below assert \"zero CTR\" or \"0% retention\": those claims came "
+                "from the same missing data — do not repeat them.\n"
+            ),
         )
         text = chat_ollama(prompt, max_tokens=800)
         match = re.search(r'\{.*\}', text, re.DOTALL)

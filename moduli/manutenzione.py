@@ -5,7 +5,9 @@ montaggio. Tutto configurabile via env, default sensati per chiunque:
 
   MIN_FREE_DISK_GB     spazio minimo libero richiesto prima del montaggio (default 5)
   MAX_CACHE_MB         tetto massimo della cache clip Pexels (default 2000 = 2GB)
+  MAX_AI_CACHE_MB      tetto della cache clip generate dall'AI (default 3000)
   CACHE_DIR            cartella cache (default cache/pexels)
+  VIDEO_AI_CACHE_DIR   cartella clip AI (default cache/ai_video)
 """
 
 import os
@@ -25,6 +27,8 @@ def _env_float(name: str, default: float) -> float:
 
 MIN_FREE_DISK_GB = _env_float("MIN_FREE_DISK_GB", 5.0)
 MAX_CACHE_MB = _env_float("MAX_CACHE_MB", 2000.0)
+AI_CACHE_DIR = os.environ.get("VIDEO_AI_CACHE_DIR", "cache/ai_video")
+MAX_AI_CACHE_MB = _env_float("MAX_AI_CACHE_MB", 3000.0)
 
 
 def spazio_libero_gb(path: str = ".") -> float:
@@ -58,23 +62,20 @@ def assicura_spazio(min_gb: float = None, work_dir: str = "output", protetti: se
     )
 
 
-def _cache_files() -> list[str]:
-    if not os.path.isdir(CACHE_DIR):
+def _cache_files(cartella: str = None) -> list[str]:
+    cartella = CACHE_DIR if cartella is None else cartella
+    if not os.path.isdir(cartella):
         return []
-    return [p for p in glob.glob(os.path.join(CACHE_DIR, "*.mp4")) if os.path.isfile(p)]
+    return [p for p in glob.glob(os.path.join(cartella, "*.mp4")) if os.path.isfile(p)]
 
 
 def cache_size_mb() -> float:
     return sum(os.path.getsize(p) for p in _cache_files()) / (1024 ** 2)
 
 
-def pulisci_cache(max_mb: float = None, protetti: set = None) -> float:
-    """Tiene la cache clip sotto `max_mb` cancellando i file piu' vecchi (LRU per
-    mtime). `max_mb=0` svuota tutto. I path in `protetti` (clip che servono alla
-    run corrente) non vengono mai cancellati. Ritorna i MB liberati."""
-    max_mb = MAX_CACHE_MB if max_mb is None else max_mb
-    protetti_abs = {os.path.abspath(p) for p in (protetti or ())}
-    files = _cache_files()
+def _pota(cartella: str, max_mb: float, protetti_abs: set) -> float:
+    """Tiene una cartella di clip sotto `max_mb` (LRU per mtime). MB liberati."""
+    files = _cache_files(cartella)
     if not files:
         return 0.0
     total = sum(os.path.getsize(p) for p in files)
@@ -97,6 +98,22 @@ def pulisci_cache(max_mb: float = None, protetti: set = None) -> float:
         except OSError:
             continue
     return liberati / (1024 ** 2)
+
+
+def pulisci_cache(max_mb: float = None, protetti: set = None) -> float:
+    """Tiene le cache clip sotto il rispettivo tetto cancellando i file piu'
+    vecchi (LRU per mtime). `max_mb=0` svuota tutto. I path in `protetti` (clip
+    che servono alla run corrente) non vengono mai cancellati. MB liberati.
+
+    Le clip generate dall'AI hanno un tetto SEPARATO: sono costate soldi, e
+    farle sfrattare da uno stock gratuito appena scaricato sarebbe il contrario
+    di quello che serve.
+    """
+    protetti_abs = {os.path.abspath(p) for p in (protetti or ())}
+    tetto_pexels = MAX_CACHE_MB if max_mb is None else max_mb
+    tetto_ai = MAX_AI_CACHE_MB if max_mb is None else max_mb
+    return (_pota(CACHE_DIR, tetto_pexels, protetti_abs)
+            + _pota(AI_CACHE_DIR, tetto_ai, protetti_abs))
 
 
 def pulisci_temp_render(work_dir: str = "output") -> int:

@@ -7,31 +7,50 @@ import platform
 import tempfile
 import re
 
-from moduli.ffmpeg_utils import ffmpeg_path as _ffmpeg, ffprobe_path as _ffprobe
+from moduli.ffmpeg_utils import (
+    ffmpeg_path as _ffmpeg,
+    ffprobe_path as _ffprobe,
+    esporta_per_moviepy as _esporta_ffmpeg,
+)
 
-import moviepy.config as _mpy_cfg
-try:
-    _mpy_cfg.FFMPEG_BINARY = _ffmpeg()
-except FileNotFoundError:
-    # niente crash all'import (es. CI senza ffmpeg): l'errore chiaro
-    # arriverà comunque al momento del render
-    pass
+# DEVE restare prima di qualsiasi import di moviepy (anche lazy, nelle funzioni)
+_esporta_ffmpeg()
 
 SEGMENT_DURATION = 5.0
 
 
-def _build_clip_sequence(clip_files: list, n_segments: int) -> list:
+# Etichetta con cui `asset.scarica_pool_clips` marca le clip generate dall'AI.
+# Costano soldi e sono le uniche che mostrano davvero la scena descritta dallo
+# script: vanno sui PRIMI segmenti, dove si decide se lo spettatore resta.
+PREFISSO_CLIP_AI = "ai#"
+
+
+def _clip_prioritarie(keywords: list, clip_paths: dict, disponibili: list) -> list:
+    ammesse = set(disponibili)
+    return [clip_paths[k] for k in keywords
+            if str(k).startswith(PREFISSO_CLIP_AI) and clip_paths.get(k) in ammesse]
+
+
+def _build_clip_sequence(clip_files: list, n_segments: int,
+                         prioritarie: list | None = None) -> list:
     """Assegna a ogni segmento una clip distinta. Ogni clip e' usata una sola
     volta finche' il pool non e' esaurito; solo allora si ricomincia (shuffle,
     senza ripetere la clip a cavallo tra un giro e l'altro). Se il pool e'
-    grande quanto i segmenti, nessuna clip viene ripetuta nel video."""
+    grande quanto i segmenti, nessuna clip viene ripetuta nel video.
+
+    `prioritarie` occupa i primi segmenti nell'ordine dato: lasciarle allo
+    shuffle significherebbe pagare clip generate dall'AI per poi vederle
+    comparire al minuto sette, quando chi doveva andarsene se n'e' gia' andato.
+    """
     uniq = list(dict.fromkeys(p for p in clip_files if p))  # dedup file fisici
     if not uniq:
         raise RuntimeError("montaggio: nessuna clip disponibile")
-    seq = []
+    disponibili = set(uniq)
+    prime = [p for p in dict.fromkeys(prioritarie or []) if p in disponibili][:n_segments]
+    seq = list(prime)
     pool = []
-    last = None
-    for _ in range(n_segments):
+    last = prime[-1] if prime else None
+    for _ in range(n_segments - len(seq)):
         if not pool:
             pool = uniq[:]
             random.shuffle(pool)
@@ -75,32 +94,56 @@ CAPTION_MIN_GAP_SECONDS = _env_int("CAPTION_MIN_GAP_SECONDS", 12)
 
 _GPU_CODEC = None
 
+GPU_PROBE_TIMEOUT = _env_int("GPU_PROBE_TIMEOUT", 25)
+
+
 def _detect_gpu_codec() -> str:
-    """Rileva codec H.264 hardware disponibile (NVENC/AMF/QSV), fallback libx264."""
+    """Rileva codec H.264 hardware disponibile (NVENC/AMF/QSV), fallback libx264.
+
+    Il probe gira alla risoluzione REALE di output: quello precedente
+    codificava un 64x64 e passava anche su macchine dove poi l'encoder si
+    impianta a 1080p, lasciando ffmpeg a `frame=0` per sempre (nessuna delle
+    chiamate ha un timeout, quindi il daemon restava appeso senza errore).
+    `VIDEO_CODEC=libx264` nel .env salta del tutto il rilevamento.
+    """
     global _GPU_CODEC
     if _GPU_CODEC is not None:
+        return _GPU_CODEC
+    forzato = os.environ.get("VIDEO_CODEC", "").strip()
+    if forzato:
+        _GPU_CODEC = forzato
+        print(f"[montaggio] Codec forzato da VIDEO_CODEC: {forzato}", flush=True)
         return _GPU_CODEC
     try:
         out = subprocess.run(
             [_ffmpeg(), "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL,
         ).stdout
         for codec in ("h264_nvenc", "h264_amf", "h264_qsv"):
-            if codec in out:
+            if codec not in out:
+                continue
+            try:
                 test = subprocess.run(
-                    [_ffmpeg(), "-hide_banner", "-loglevel", "error",
-                     "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+                    [_ffmpeg(), "-hide_banner", "-loglevel", "error", "-nostdin",
+                     "-f", "lavfi",
+                     "-i", f"color=black:s={OUTPUT_W}x{OUTPUT_H}:r={OUTPUT_FPS}:d=0.5",
                      "-c:v", codec, "-f", "null", "-"],
-                    capture_output=True, timeout=15
+                    capture_output=True, timeout=GPU_PROBE_TIMEOUT,
+                    stdin=subprocess.DEVNULL,
                 )
-                if test.returncode == 0:
-                    _GPU_CODEC = codec
-                    print(f"[montaggio] GPU codec: {codec}", flush=True)
-                    return codec
+            except subprocess.TimeoutExpired:
+                print(f"[montaggio] {codec} bloccato a {OUTPUT_W}x{OUTPUT_H} — scartato",
+                      flush=True)
+                continue
+            if test.returncode == 0:
+                _GPU_CODEC = codec
+                print(f"[montaggio] GPU codec: {codec}", flush=True)
+                return codec
     except Exception as e:
         print(f"[montaggio] Rilevamento GPU fallito: {e}", flush=True)
     _GPU_CODEC = "libx264"
-    print(f"[montaggio] Nessuna GPU compatibile — uso CPU (libx264)", flush=True)
+    print("[montaggio] Nessuna GPU compatibile — uso CPU (libx264)", flush=True)
     return _GPU_CODEC
 BG_MUSIC_PATH = "assets/background.mp3"
 BG_MUSIC_DIR = "assets/music"
@@ -146,24 +189,25 @@ def _resize_to_target(src: str) -> str:
         return dst
     codec = _detect_gpu_codec()
     if codec == "h264_nvenc":
-        cmd = [_ffmpeg(), '-y', '-hwaccel', 'cuda', '-i', src,
+        cmd = [_ffmpeg(), '-y', '-nostdin', '-hwaccel', 'cuda', '-i', src,
                '-vf', f'scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=disable',
                '-c:v', codec, '-preset', 'p4', '-cq', '23', '-an', dst]
     elif codec in ("h264_amf", "h264_qsv"):
-        cmd = [_ffmpeg(), '-y', '-i', src,
+        cmd = [_ffmpeg(), '-y', '-nostdin', '-i', src,
                '-vf', f'scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=disable',
                '-c:v', codec, '-quality', 'speed', '-an', dst]
     else:
-        cmd = [_ffmpeg(), '-y', '-i', src,
+        cmd = [_ffmpeg(), '-y', '-nostdin', '-i', src,
                '-vf', f'scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=disable',
                '-c:v', 'libx264', '-preset', X264_PRESET, '-crf', str(X264_CRF),
                '-threads', str(FFMPEG_THREADS), '-an', dst]
-    subprocess.run(cmd, check=True, capture_output=True)
-    # elimina originale — teniamo solo il 1080p convertito
-    try:
-        os.remove(src)
-    except OSError:
-        pass
+    subprocess.run(cmd, check=True, capture_output=True,
+                   timeout=FFMPEG_TIMEOUT, stdin=subprocess.DEVNULL)
+    # NON cancellare `src`: il checkpoint della pipeline e il set `protetti`
+    # della pulizia cache referenziano il path originale. Cancellandolo, un
+    # crash a meta' render rendeva il checkpoint inservibile ("nessuna clip
+    # leggibile") proprio nel caso per cui esiste. Lo spazio resta comunque
+    # limitato da MAX_CACHE_MB (pulizia LRU in manutenzione.py).
     return dst
 
 
@@ -175,8 +219,27 @@ def _media_duration(path: str) -> float:
         "-of", "default=noprint_wrappers=1:nokey=1",
         path,
     ]
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+    out = subprocess.run(cmd, check=True, capture_output=True, text=True,
+                         timeout=60, stdin=subprocess.DEVNULL).stdout.strip()
     return max(float(out or 0), 0.01)
+
+
+def _risolvi_variante(path: str) -> str:
+    """Se `path` non esiste, cerca una variante ridimensionata dello stesso
+    file (`_720p`/`_1080p`): un checkpoint ripreso dopo un render MoviePy
+    referenzia il nome originale, non quello convertito."""
+    if os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    for suffix in ("_1080p", "_720p", "_480p"):
+        if root.endswith(suffix):
+            root = root[:-len(suffix)]
+            break
+    for candidato in (f"{root}_{OUTPUT_H}p{ext}", f"{root}_1080p{ext}",
+                      f"{root}_720p{ext}", f"{root}{ext}"):
+        if os.path.exists(candidato):
+            return candidato
+    return path
 
 
 def _filtra_clip_leggibili(clip_files: list) -> tuple[list, dict]:
@@ -184,7 +247,7 @@ def _filtra_clip_leggibili(clip_files: list) -> tuple[list, dict]:
     download troncati) invece di far crashare il render. Ritorna i file validi
     e le loro durate gia' misurate (evita un secondo ffprobe per segmento)."""
     validi, durate = [], {}
-    for p in dict.fromkeys(p for p in clip_files if p):
+    for p in dict.fromkeys(_risolvi_variante(p) for p in clip_files if p):
         try:
             durate[p] = _media_duration(p)
             validi.append(p)
@@ -210,6 +273,10 @@ def _caption_filter(caption: str | None) -> str:
         vf.append(
             "drawtext="
             f"{font_part}"
+            # expansion=none: senza, un '%' nel testo fa "Stray %" e drawtext
+            # NON disegna nulla uscendo con codice 0 — la caption spariva in
+            # silenzio ogni volta che la frase conteneva una percentuale
+            "expansion=none:"
             f"text='{text}':"
             "x=(w-text_w)/2:"
             "y=h-text_h-72:"
@@ -247,22 +314,62 @@ def _drawtext_font_part() -> str:
 
 
 def _escape_drawtext(text: str) -> str:
+    # Gli apici non sono gestiti qui: dentro text='...' ffmpeg non accetta
+    # nessuna forma di escaping per l'apice singolo, quindi `_caption_text`
+    # li sostituisce a monte con le varianti tipografiche.
+    # '%' NON va escapato: con expansion=none e' un carattere normale, mentre
+    # "\%" resta letterale e sporca il testo
     return (
         text.replace("\\", "\\\\")
         .replace(":", "\\:")
-        .replace("'", "\\'")
-        .replace("%", "\\%")
         .replace(",", "\\,")
     )
+
+
+# apici sostituiti con le varianti tipografiche: visivamente identici ma non
+# sono delimitatori per il parser dei filtri ffmpeg (una caption tipo "DON'T"
+# faceva fallire il segmento e quindi l'intera pipeline)
+_APICI = {"'": "’", '"': "”", "`": "’", "´": "’"}
+
+# parole su cui una caption troncata non deve mai finire (IT + EN)
+_PAROLE_APPESE = {
+    "THE", "A", "AN", "OF", "TO", "IN", "ON", "FOR", "AND", "OR", "BUT", "WITH",
+    "AT", "BY", "FROM", "AS", "THAT", "THIS", "IS", "ARE", "WAS", "WERE", "IT",
+    "ITS", "THEIR", "YOUR", "OUR", "HIS", "HER", "MORE", "THAN", "SO", "IF",
+    "IL", "LO", "LA", "I", "GLI", "LE", "UN", "UNO", "UNA", "DI", "DEL", "DELLA",
+    "DEI", "DELLE", "DA", "DAL", "PER", "CON", "SU", "TRA", "FRA", "CHE", "E",
+    "ED", "O", "MA", "SE", "COME", "NON", "AL", "ALLA", "AI", "ALLE", "NEL",
+    "NELLA", "SUL", "SULLA", "È",
+}
+
+
+def _max_caption_chars() -> int:
+    """Caratteri che stanno su una riga alla risoluzione corrente. drawtext non
+    va a capo e non riduce il font: un limite fisso di 78 caratteri finiva
+    tagliato ai bordi appena il video non era 1920px."""
+    larghezza_utile = OUTPUT_W * 0.92
+    larghezza_char = max(1.0, CAPTION_FONT_SIZE * 0.55)
+    return max(16, int(larghezza_utile / larghezza_char))
 
 
 def _caption_text(text: str) -> str:
     cleaned = " ".join(text.replace("\n", " ").split())
     cleaned = cleaned.strip(" -–—:;,.!?\"'").upper()
+    for grezzo, tipografico in _APICI.items():
+        cleaned = cleaned.replace(grezzo, tipografico)
     words = cleaned.split()
     if len(words) > 10:
-        cleaned = " ".join(words[:10])
-    return cleaned[:78]
+        words = words[:10]
+    # taglia a parole intere finche' la riga non entra nello schermo
+    limite = _max_caption_chars()
+    while words and len(" ".join(words)) > limite:
+        words.pop()
+    # una caption troncata non deve finire su una parola funzionale
+    # ("...REDUCTION IN COST FOR THE"): meglio una frase piu' corta ma chiusa
+    while len(words) > 3 and words[-1].strip(".,;:!?") in _PAROLE_APPESE:
+        words.pop()
+    # niente punteggiatura penzolante dopo il taglio ("...THIS SHIFT,")
+    return " ".join(words).rstrip(" ,;:-–—")
 
 
 def _split_sentences(script: str) -> list[str]:
@@ -319,61 +426,158 @@ def _select_key_captions(script: str, total_duration: float, n_segments: int) ->
     return captions
 
 
+def _codec_args(codec: str) -> list[str]:
+    if codec == "h264_nvenc":
+        # `-rc vbr -b:v 0` serve a rendere `-cq` un vero constant-quality:
+        # senza, NVENC applica il proprio rate control di default e produce
+        # file enormi (misurato: 304MB contro i 75MB di libx264 a parita' di
+        # durata e risoluzione)
+        return ["-c:v", codec, "-preset", "p4", "-rc", "vbr",
+                "-cq", str(X264_CRF), "-b:v", "0"]
+    if codec in ("h264_amf", "h264_qsv"):
+        return ["-c:v", codec, "-quality", "speed", "-global_quality", str(X264_CRF)]
+    return ["-c:v", "libx264", "-preset", X264_PRESET, "-crf", str(X264_CRF),
+            "-threads", str(FFMPEG_THREADS)]
+
+
+def _codec_segmento() -> str:
+    """Codec per un segmento. Il path ffmpeg usava sempre libx264 anche quando
+    `_detect_gpu_codec()` aveva trovato un encoder hardware."""
+    return "libx264" if _PI_LIMITED else _detect_gpu_codec()
+
+
+# un segmento dura SEGMENT_DURATION secondi: oltre questo tempo di encoding
+# l'encoder e' bloccato, non lento
+SEGMENT_TIMEOUT = _env_int("SEGMENT_TIMEOUT", 180)
+# concat e mux lavorano sul video intero: piu' generoso, ma mai infinito
+FFMPEG_TIMEOUT = _env_int("FFMPEG_TIMEOUT", 1800)
+
+
+def _render_workers() -> int:
+    """Quanti segmenti rendere in parallelo. Un video da 8 minuti sono ~96
+    invocazioni ffmpeg: in serie il render e' inutilmente lungo."""
+    override = _env_int("RENDER_WORKERS", 0)
+    if override > 0:
+        return override
+    if _PI_LIMITED:
+        return 1  # Raspberry & co.: la CPU e' gia' satura con un processo
+    if _detect_gpu_codec() != "libx264":
+        return 2  # le sessioni encoder hardware sono limitate (NVENC: 2-3)
+    cpu = os.cpu_count() or 2
+    return max(1, min(4, cpu // max(1, FFMPEG_THREADS)))
+
+
 def _render_segment_ffmpeg(src: str, dst: str, offset: float, duration: float, caption: str | None = None, src_duration: float | None = None) -> None:
     if src_duration is None:
         src_duration = _media_duration(src)
     vf = _caption_filter(caption)
     if src_duration < duration:
-        cmd = [_ffmpeg(), "-y", "-stream_loop", "-1", "-i", src, "-t", f"{duration:.3f}"]
+        ingresso = ["-stream_loop", "-1", "-i", src, "-t", f"{duration:.3f}"]
     else:
-        cmd = [_ffmpeg(), "-y", "-ss", f"{offset % src_duration:.3f}", "-i", src, "-t", f"{duration:.3f}"]
-    cmd += [
-        "-vf", vf,
-        "-an",
-        "-c:v", "libx264",
-        "-preset", X264_PRESET,
-        "-crf", str(X264_CRF),
-        "-threads", str(FFMPEG_THREADS),
-        "-movflags", "+faststart",
-        dst,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg segment failed:\n{result.stderr[-2000:]}")
+        # L'offset va limitato a (durata_sorgente - durata_segmento): con
+        # `offset % src_duration` il seek poteva cadere a ridosso della fine
+        # della clip e ffmpeg produceva un segmento piu' corto del richiesto.
+        # Sommati, quei segmenti corti rendevano il video piu' breve della
+        # narrazione, che veniva quindi troncata da `-shortest` nel mux.
+        massimo = src_duration - duration
+        inizio = (offset % massimo) if massimo > 0.05 else 0.0
+        ingresso = ["-ss", f"{inizio:.3f}", "-i", src, "-t", f"{duration:.3f}"]
+
+    codec = _codec_segmento()
+    ultimo_errore = ""
+    # se l'encoder hardware si impianta o fallisce, si riprova su CPU: senza
+    # timeout un ffmpeg bloccato appendeva il daemon per sempre, senza errore
+    for tentativo in (codec, "libx264"):
+        cmd = ([_ffmpeg(), "-y", "-nostdin"] + ingresso + ["-vf", vf, "-an"]
+               + _codec_args(tentativo) + ["-movflags", "+faststart", dst])
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=SEGMENT_TIMEOUT, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            ultimo_errore = f"{tentativo}: nessun output entro {SEGMENT_TIMEOUT}s (encoder bloccato)"
+            print(f"[montaggio] {ultimo_errore}", flush=True)
+        else:
+            if result.returncode == 0:
+                return
+            ultimo_errore = f"{tentativo}: {result.stderr[-1500:]}"
+        if tentativo == "libx264":
+            break
+        print(f"[montaggio] {tentativo} fallito — ripiego su libx264", flush=True)
+        _disabilita_gpu()
+    raise RuntimeError(f"ffmpeg segment failed:\n{ultimo_errore}")
+
+
+def _disabilita_gpu() -> None:
+    """Dopo un fallimento dell'encoder hardware, i segmenti successivi vanno
+    direttamente su CPU invece di ritentare (e fallire) uno per uno."""
+    global _GPU_CODEC
+    if _GPU_CODEC != "libx264":
+        print("[montaggio] Encoder GPU disattivato per questo render", flush=True)
+        _GPU_CODEC = "libx264"
+
+
+# Loudness di consegna. YouTube normalizza a circa -14 LUFS: consegnare piu'
+# piano non fa alzare il volume, fa solo suonare il video piu' debole degli
+# altri nel feed. Il mp3 di edge-tts arriva a -26 dB di media, mono 24 kHz.
+LOUDNESS_TARGET_LUFS = float(os.environ.get("AUDIO_LUFS", "-14"))
+AUDIO_SAMPLE_RATE = os.environ.get("AUDIO_SAMPLE_RATE", "48000")
+AUDIO_CHANNELS = os.environ.get("AUDIO_CHANNELS", "2")
+AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "192k")
+
+
+def _filtro_loudnorm() -> str:
+    """loudnorm a passata singola: porta la narrazione al target LUFS.
+
+    `tp=-1.5` lascia margine di picco (niente clipping dopo la ricodifica AAC),
+    `lra=11` e' il range dinamico consigliato per il parlato.
+    """
+    return f"loudnorm=I={LOUDNESS_TARGET_LUFS}:TP=-1.5:LRA=11"
 
 
 def _mux_audio_ffmpeg(video_path: str, audio_path: str, output_path: str, music_path: str | None, duration: float) -> None:
+    # Senza questi parametri l'audio finale ereditava il formato del TTS
+    # (mono 24 kHz, ~72 kb/s): il video usciva piu' piano e piu' povero di
+    # qualunque altro sul canale.
+    codifica_audio = [
+        "-c:a", "aac",
+        "-b:a", AUDIO_BITRATE,
+        "-ar", AUDIO_SAMPLE_RATE,
+        "-ac", AUDIO_CHANNELS,
+    ]
     if music_path:
         cmd = [
-            _ffmpeg(), "-y",
+            _ffmpeg(), "-y", "-nostdin",
             "-i", video_path,
             "-i", audio_path,
             "-stream_loop", "-1", "-i", music_path,
             "-filter_complex",
             f"[1:a]volume=1.0[a0];[2:a]volume={_bg_volume()},atrim=0:{duration:.3f}[a1];"
-            "[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[a]",
+            "[a0][a1]amix=inputs=2:duration=first:dropout_transition=0,"
+            f"{_filtro_loudnorm()}[a]",
             "-map", "0:v:0",
             "-map", "[a]",
             "-c:v", "copy",
-            "-c:a", "aac",
+            *codifica_audio,
             "-shortest",
             "-movflags", "+faststart",
             output_path,
         ]
     else:
         cmd = [
-            _ffmpeg(), "-y",
+            _ffmpeg(), "-y", "-nostdin",
             "-i", video_path,
             "-i", audio_path,
             "-map", "0:v:0",
             "-map", "1:a:0",
+            "-af", _filtro_loudnorm(),
             "-c:v", "copy",
-            "-c:a", "aac",
+            *codifica_audio,
             "-shortest",
             "-movflags", "+faststart",
             output_path,
         ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            timeout=FFMPEG_TIMEOUT, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg mux failed:\n{result.stderr[-2000:]}")
 
@@ -404,26 +608,66 @@ def _monta_video_ffmpeg(audio_path: str, keywords: list, clip_paths: dict, outpu
             "montaggio: nessuna clip leggibile — la cache e' stata svuotata o i "
             "download sono corrotti. Rilancia la pipeline con /forza."
         )
-    clip_sequence = _build_clip_sequence(clip_files, n_segments)
+    clip_sequence = _build_clip_sequence(
+        clip_files, n_segments,
+        prioritarie=_clip_prioritarie(keywords, clip_paths, clip_files))
+    workers = _render_workers()
+    print(f"[montaggio] Render segmenti: {workers} in parallelo", flush=True)
     with tempfile.TemporaryDirectory(prefix="render_", dir=os.path.dirname(output_path) or None) as tmpdir:
-        segment_paths = []
+        lavori = []
         for i in range(n_segments):
             seg_start = i * SEGMENT_DURATION
             remaining = total_duration - seg_start
             if remaining <= 0:
                 break
-            seg_dur = min(SEGMENT_DURATION, remaining)
             clip_path = clip_sequence[i]
-            seg_path = os.path.join(tmpdir, f"seg_{i:04d}.mp4")
-            _render_segment_ffmpeg(clip_path, seg_path, seg_start, seg_dur, captions.get(i), durate.get(clip_path))
-            segment_paths.append(seg_path)
+            lavori.append((
+                i, clip_path, os.path.join(tmpdir, f"seg_{i:04d}.mp4"),
+                seg_start, min(SEGMENT_DURATION, remaining),
+                captions.get(i), durate.get(clip_path),
+            ))
+        segment_paths = [j[2] for j in lavori]
 
-            pct = int((i + 1) / n_segments * 80)
-            if pct % 10 == 0:
-                print(f"[montaggio] Segmenti: {pct}%", flush=True)
-                if on_progress:
-                    on_progress(pct, "calcolo in corso")
+        fatti = 0
+        ultimo_pct = 0
+        inizio = time.time()
 
+        def _avanza():
+            """Progresso su segmenti completati: con il render in parallelo
+            l'indice del ciclo non e' piu' un indicatore di avanzamento."""
+            nonlocal fatti, ultimo_pct
+            fatti += 1
+            pct = int(fatti / max(1, len(lavori)) * 80)
+            if pct < ultimo_pct + 10:
+                return
+            ultimo_pct = pct
+            trascorso = time.time() - inizio
+            eta = (trascorso / fatti * (len(lavori) - fatti)) if fatti else 0
+            eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+            print(f"[montaggio] Segmenti: {pct}% — ETA {eta_str}", flush=True)
+            if on_progress:
+                on_progress(pct, eta_str)
+
+        if workers <= 1:
+            for _, src, dst, off, dur, cap, sdur in lavori:
+                _render_segment_ffmpeg(src, dst, off, dur, cap, sdur)
+                _avanza()
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_render_segment_ffmpeg, src, dst, off, dur, cap, sdur): dst
+                    for _, src, dst, off, dur, cap, sdur in lavori
+                }
+                for fut in as_completed(futures):
+                    fut.result()  # rilancia il primo errore, annullando il render
+                    _avanza()
+
+        # I segmenti valgono l'80% della barra: senza queste tappe il
+        # progresso si fermava a "80% — ETA 0m 0s" per tutta la durata di
+        # concat e mux, e sembrava che il render si fosse piantato.
+        if on_progress:
+            on_progress(80, "unisco i segmenti")
         list_path = os.path.join(tmpdir, "segments.txt")
         with open(list_path, "w", encoding="utf-8") as f:
             for path in segment_paths:
@@ -431,17 +675,35 @@ def _monta_video_ffmpeg(audio_path: str, keywords: list, clip_paths: dict, outpu
 
         silent_video = os.path.join(tmpdir, "video_senza_audio.mp4")
         subprocess.run(
-            [_ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", silent_video],
-            check=True,
+            [_ffmpeg(), "-y", "-nostdin", "-v", "error", "-f", "concat", "-safe", "0",
+             "-i", list_path, "-c", "copy", silent_video],
+            check=True, capture_output=True,
+            timeout=FFMPEG_TIMEOUT, stdin=subprocess.DEVNULL,
         )
         if on_progress:
-            on_progress(90, "mux audio")
+            on_progress(90, "audio e musica")
         _mux_audio_ffmpeg(silent_video, audio_path, output_path, music_path, total_duration)
+        if on_progress:
+            on_progress(100, "fatto")
 
 
-def _make_segment(clip_path: str, time_offset: float, duration: float):
+def _make_segment(clip_path: str, time_offset: float, duration: float, cache: dict | None = None):
+    """`cache` mappa path -> VideoFileClip riusato tra i segmenti.
+
+    Prima ogni segmento apriva un VideoFileClip nuovo e non lo chiudeva mai:
+    un video da 8 minuti significava ~96 reader ffmpeg e altrettanti handle di
+    file aperti fino alla fine del processo. Riusando il clip per path, gli
+    oggetti aperti scendono al numero di clip distinte e `_chiudi_clip()` li
+    chiude tutti a fine render."""
     from moviepy import VideoFileClip, concatenate_videoclips
-    clip = VideoFileClip(_resize_to_target(clip_path), audio=False)
+    path = _resize_to_target(clip_path)
+    if cache is None:
+        clip = VideoFileClip(path, audio=False)
+    else:
+        clip = cache.get(path)
+        if clip is None:
+            clip = VideoFileClip(path, audio=False)
+            cache[path] = clip
     if clip.duration < duration:
         times = int(duration / clip.duration) + 1
         clip = concatenate_videoclips([clip] * times)
@@ -451,6 +713,14 @@ def _make_segment(clip_path: str, time_offset: float, duration: float):
         offset = 0
         end = duration
     return clip.subclipped(offset, end)
+
+
+def _chiudi_clip(clips) -> None:
+    for clip in clips:
+        try:
+            clip.close()
+        except Exception:
+            pass
 
 
 from proglog import ProgressBarLogger
@@ -549,7 +819,10 @@ def monta_video(audio_path: str, keywords: list, clip_paths: dict, output_path: 
             "montaggio: nessuna clip leggibile — la cache e' stata svuotata o i "
             "download sono corrotti. Rilancia la pipeline con /forza."
         )
-    clip_sequence = _build_clip_sequence(clip_files, n_segments)
+    clip_sequence = _build_clip_sequence(
+        clip_files, n_segments,
+        prioritarie=_clip_prioritarie(keywords, clip_paths, clip_files))
+    aperti: dict = {}  # path -> VideoFileClip, riusato tra i segmenti
     for i in range(n_segments):
         seg_start = i * SEGMENT_DURATION
         remaining = total_duration - seg_start
@@ -559,7 +832,7 @@ def monta_video(audio_path: str, keywords: list, clip_paths: dict, output_path: 
 
         clip_path = clip_sequence[i]
 
-        seg = _make_segment(clip_path, seg_start, seg_dur)
+        seg = _make_segment(clip_path, seg_start, seg_dur, cache=aperti)
         segments.append(seg)
 
     if not segments:
@@ -592,15 +865,24 @@ def monta_video(audio_path: str, keywords: list, clip_paths: dict, output_path: 
 
     codec = _detect_gpu_codec()
     preset = "p4" if codec == "h264_nvenc" else X264_PRESET
-    video.write_videofile(
-        output_path,
-        fps=OUTPUT_FPS,
-        codec=codec,
-        audio_codec="aac",
-        threads=FFMPEG_THREADS,
-        preset=preset,
-        logger=prog_logger,
-    )
-
-    narration.close()
-    video.close()
+    try:
+        video.write_videofile(
+            output_path,
+            fps=OUTPUT_FPS,
+            codec=codec,
+            audio_codec="aac",
+            # senza, moviepy scrive l'audio a 44.1 kHz e bitrate di default:
+            # stessa perdita di qualita' che il percorso ffmpeg evita
+            audio_fps=int(AUDIO_SAMPLE_RATE),
+            audio_bitrate=AUDIO_BITRATE,
+            threads=FFMPEG_THREADS,
+            preset=preset,
+            logger=prog_logger,
+        )
+    finally:
+        # chiusura anche in caso di errore: altrimenti i reader ffmpeg
+        # restano appesi e su Windows i file di cache non sono cancellabili.
+        # Vanno chiuse anche le tracce audio: il reader della musica di
+        # sottofondo, lasciato al garbage collector, stampa a fine processo
+        # un "OSError: [WinError 6] Handle non valido" dal suo __del__.
+        _chiudi_clip([narration, video, final_audio, *audio_tracks, *aperti.values()])

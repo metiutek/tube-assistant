@@ -8,6 +8,9 @@ from io import BytesIO
 THUMB_W, THUMB_H = 1280, 720
 FONT_PATH = "assets/font_bold.ttf"
 SHADOW_OFFSET = 3
+# YouTube sovrappone la durata del video nell'angolo in basso a destra della
+# copertina: il testo non deve mai arrivarci sotto
+MARGINE_SICURO_BASSO = 64
 
 HF_MODEL = "black-forest-labs/FLUX.1-schnell"
 OPENROUTER_IMAGE_URL = "https://openrouter.ai/api/v1/images/generations"
@@ -85,16 +88,31 @@ def _fetch_image_openrouter(prompt: str) -> Image.Image:
     return Image.open(BytesIO(img_r.content)).convert("RGB")
 
 
-def _fetch_image_pollinations(title: str, mood: str = None, style: str = None) -> Image.Image:
+def _fetch_image_pollinations(prompt: str, mood: str = None, style: str = None) -> Image.Image:
+    """Genera lo sfondo con Pollinations a partire dal prompt COMPLETO.
+
+    Prima questa funzione riceveva solo il titolo e si ricostruiva un prompt
+    generico: il `thumbnail_description` dettagliato prodotto dall'LLM — per
+    cui `cervello.py` dedica un intero paragrafo di istruzioni — veniva
+    scartato. Siccome pollinations e' il provider di DEFAULT, in pratica quella
+    descrizione non veniva quasi mai usata, e il log la stampava lo stesso
+    facendo sembrare il contrario.
+    """
     mood_visual = _MOOD_VISUALS.get((mood or "").lower(), "cinematic dramatic lighting")
-    user_style = style or "cinematic dramatic lighting, dark moody"
-    prompt = (
-        f"professional youtube thumbnail, {user_style}, {mood_visual}, "
-        f"photorealistic high detail, tech AI futuristic background, "
-        f"empty lower third space for text overlay, 16:9, "
-        f"sharp focus, vivid colors, attention-grabbing composition, "
-        f"subject: {title}"
-    )
+    prompt = (prompt or "").strip()
+    if style and style not in prompt:
+        prompt = f"{prompt} Style: {style}."
+    if mood_visual not in prompt:
+        prompt = f"{prompt} {mood_visual}."
+    # Il soggetto va per PRIMO. Prima il prompt si apriva con "Professional
+    # YouTube thumbnail, 16:9.": nei modelli diffusion il peso cala lungo il
+    # prompt, e la descrizione specifica (l'unica parte che distingue questa
+    # copertina da qualunque altra) finiva in coda. Risultato: immagini
+    # generiche che ignoravano la scena richiesta.
+    # Lo spazio in basso serve all'overlay del testo disegnato da _draw_title.
+    prompt = (f"{prompt} Professional YouTube thumbnail, 16:9. "
+              "Empty lower third space for a text overlay. "
+              "No text, no watermarks, no logos.")
     url = (
         f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}"
         f"?width={THUMB_W}&height={THUMB_H}&nologo=true&enhance=true&model=flux"
@@ -111,6 +129,24 @@ def _fetch_image_pollinations(title: str, mood: str = None, style: str = None) -
     if "image" not in ct:
         raise RuntimeError(f"Pollinations non-image response: {r.text[:160]}")
     return Image.open(BytesIO(r.content)).convert("RGB")
+
+
+def _porta_a_misura(img: Image.Image) -> Image.Image:
+    """Porta l'immagine a 1280x720 recuperando un po' di nitidezza.
+
+    Pollinations ignora `width`/`height` e consegna 1024x576 qualunque cosa si
+    chieda: l'immagine veniva ingrandita del 25% e la copertina arrivava su
+    YouTube visibilmente morbida. L'unsharp mask non inventa dettaglio, ma
+    ridà il contrasto sui bordi che l'interpolazione LANCZOS smussa.
+    """
+    if img.size == (THUMB_W, THUMB_H):
+        return img
+    ingrandita = img.width < THUMB_W
+    img = img.resize((THUMB_W, THUMB_H), Image.LANCZOS)
+    if ingrandita:
+        from PIL import ImageFilter
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.6, percent=110, threshold=3))
+    return img
 
 
 def _fetch_image_da_clip() -> Image.Image:
@@ -211,38 +247,64 @@ def _get_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 _FONT_PRESETS = {"A": 240, "B": 200, "C": 160, "D": 120}
+# tetto per numero di parole: l'LLM sceglie il preset e sbaglia spesso
+# (chiede "B" per tre parole nonostante le sue stesse regole dicano "C"),
+# e un preset troppo grande riempie meta' copertina con il testo
+_MAX_PRESET_PER_PAROLE = {1: "A", 2: "B", 3: "C"}
+
+
+def _preset_sensato(preset: str, testo: str) -> str:
+    preset = (preset or "C").strip().upper()
+    if preset not in _FONT_PRESETS:
+        preset = "C"
+    parole = len(testo.split())
+    tetto = _MAX_PRESET_PER_PAROLE.get(parole, "D")
+    # le chiavi sono ordinate dal piu' grande al piu' piccolo: A < B < C < D
+    return max(preset, tetto)
+
+
+# sotto questa dimensione non vale la pena insistere con una riga sola:
+# meglio due righe piu' grandi che una riga minuscola
+_MIN_FONT_RIGA_SINGOLA = 90
+
+
+def _prova_size(title: str, size: int, max_w: int, max_h: int, righe_max: int):
+    """Ritorna (font, lines) se il titolo entra in `righe_max` righe a questa
+    dimensione, altrimenti None."""
+    font = _get_font(size)
+    # quanti caratteri per riga a questo size (stima su larghezza media)
+    avg_char = max(1, size * 0.55)
+    wrap_chars = max(8, int(max_w / avg_char))
+    lines = textwrap.wrap(title, width=wrap_chars) or [title]
+    if len(lines) > righe_max:
+        return None
+    widest = max((font.getbbox(ln)[2] - font.getbbox(ln)[0]) for ln in lines)
+    if widest > max_w or len(lines) * (size + 12) > max_h:
+        return None
+    return font, lines
 
 
 def _fit_title(title: str, max_w: int, max_h: int,
                max_lines: int = 3, max_start: int = 80) -> tuple:
     """Trova il font piu' grande possibile che sta in max_w x max_h.
-    Ritorna (font, lines, font_size). Testo mai tagliato."""
+
+    Prova prima a far stare tutto su UNA riga, poi due, poi tre: cercando
+    direttamente la dimensione piu' grande che entra in tre righe si otteneva
+    un titolo spezzato su due righe enormi che occupavano meta' copertina,
+    anche quando una riga sola sarebbe bastata con un font di poco piu' piccolo.
+    Ritorna (font, lines, font_size). Testo mai tagliato.
+    """
     title = " ".join(title.split())
-    best = None
-    for size in range(max_start, 39, -4):
-        font = _get_font(size)
-        # quanti caratteri per riga a questo size (stima su larghezza media)
-        avg_char = max(1, size * 0.55)
-        wrap_chars = max(8, int(max_w / avg_char))
-        lines = textwrap.wrap(title, width=wrap_chars)
-        if len(lines) > max_lines:
-            continue
-        # misura reale
-        widest = 0
-        for ln in lines:
-            bb = font.getbbox(ln)
-            widest = max(widest, bb[2] - bb[0])
-        line_h = size + 12
-        block_h = len(lines) * line_h
-        if widest <= max_w and block_h <= max_h:
-            best = (font, lines, size)
-            break
-    if best is None:
-        # fallback: testo sempre visibile, mai tagliato
-        font = _get_font(44)
-        lines = textwrap.wrap(title, width=max(8, int(max_w / (44 * 0.55))))
-        best = (font, lines, 44)
-    return best
+    for righe_max in range(1, max_lines + 1):
+        minimo = _MIN_FONT_RIGA_SINGOLA if righe_max == 1 else 40
+        for size in range(max_start, minimo - 1, -4):
+            trovato = _prova_size(title, size, max_w, max_h, righe_max)
+            if trovato:
+                return trovato[0], trovato[1], size
+    # fallback: testo sempre visibile, mai tagliato
+    font = _get_font(44)
+    lines = textwrap.wrap(title, width=max(8, int(max_w / (44 * 0.55)))) or [title]
+    return font, lines, 44
 
 
 def _parse_color(color_str: str) -> tuple:
@@ -276,9 +338,11 @@ def _draw_title(img: Image.Image, title: str,
         img = img.resize((THUMB_W, THUMB_H), Image.LANCZOS)
     img = img.convert("RGBA")
 
-    max_text_w = int(THUMB_W * 0.90)
+    # 0.86 invece di 0.90: con il 90% il testo arrivava praticamente a filo
+    # dei bordi laterali, senza aria attorno
+    max_text_w = int(THUMB_W * 0.86)
     max_text_h = int(THUMB_H * 0.55)  # più alto = più righe disponibili, mai tagliato
-    max_start = _FONT_PRESETS.get((font_size_preset or "C").strip().upper(), _FONT_PRESETS["C"])
+    max_start = _FONT_PRESETS[_preset_sensato(font_size_preset, title)]
     font, lines, font_size = _fit_title(title, max_text_w, max_text_h, max_start=max_start)
 
     # scala manuale opzionale (0.3-1.0)
@@ -293,41 +357,56 @@ def _draw_title(img: Image.Image, title: str,
     block_h = len(lines) * line_h + 20
     padding = 40
 
+    outline = max(2, font_size // 22)  # contorno proporzionale al font
+    shadow = max(SHADOW_OFFSET, font_size // 24)
+
+    # Banda sfumata dietro al testo. Costruita come maschera larga 1px poi
+    # ridimensionata: il doppio ciclo putpixel precedente faceva ~500.000
+    # chiamate Python per ogni copertina (secondi di CPU per nulla).
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     if position == "alto":
-        strip_end = block_h + padding * 2 + 30
-        for y in range(0, strip_end):
-            alpha = int(210 * ((strip_end - y) / strip_end))
-            for x in range(THUMB_W):
-                overlay.putpixel((x, y), (0, 0, 0, alpha))
+        strip_end = max(1, min(THUMB_H, block_h + padding * 2 + 30))
+        alphas = [int(210 * ((strip_end - y) / strip_end)) for y in range(strip_end)]
+        strip_top = 0
         text_y_start = padding
     else:
-        strip_top = THUMB_H - block_h - padding * 2 - 30
-        for y in range(strip_top, THUMB_H):
-            alpha = int(210 * ((y - strip_top) / (THUMB_H - strip_top)))
-            for x in range(THUMB_W):
-                overlay.putpixel((x, y), (0, 0, 0, alpha))
+        strip_top = max(0, THUMB_H - block_h - padding * 2 - 30)
         text_y_start = THUMB_H - block_h - padding
+        # `line_h` e' una stima: le maiuscole alte, i discendenti, il contorno e
+        # l'ombra escono sotto di essa, e l'ultima riga finiva a ridosso del
+        # bordo — proprio dove YouTube stampa la durata del video. Qui si misura
+        # il fondo reale dell'ultima riga e si alza il blocco quanto serve.
+        fondo_reale = (text_y_start + (len(lines) - 1) * line_h
+                       + font.getbbox(lines[-1])[3] + outline + shadow)
+        eccesso = fondo_reale - (THUMB_H - MARGINE_SICURO_BASSO)
+        if eccesso > 0:
+            text_y_start -= eccesso
+            strip_top = max(0, strip_top - eccesso)
+        altezza = THUMB_H - strip_top
+        alphas = [int(210 * (y / altezza)) for y in range(altezza)]
+
+    if alphas:
+        colonna = Image.new("L", (1, len(alphas)))
+        colonna.putdata(alphas)
+        banda = Image.new("RGBA", (THUMB_W, len(alphas)), (0, 0, 0, 255))
+        banda.putalpha(colonna.resize((THUMB_W, len(alphas))))
+        overlay.paste(banda, (0, strip_top))
     img = Image.alpha_composite(img, overlay)
 
     draw = ImageDraw.Draw(img)
     fill_rgba = (*text_color, 255)
     y = text_y_start
 
-    outline = max(2, font_size // 22)  # contorno proporzionale al font
-    shadow = max(SHADOW_OFFSET, font_size // 24)
-
     for line in lines:
         bbox = font.getbbox(line)
         line_w = bbox[2] - bbox[0]
         x = (THUMB_W - line_w) // 2
-        for dx in range(-outline, outline + 1):
-            for dy in range(-outline, outline + 1):
-                if dx != 0 or dy != 0:
-                    draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 255))
         draw.text((x + shadow, y + shadow), line,
                   font=font, fill=(0, 0, 0, 200))
-        draw.text((x, y), line, font=font, fill=fill_rgba)
+        # stroke_width nativo di Pillow: prima il contorno era simulato con un
+        # doppio ciclo di draw.text, fino a 441 disegni per riga con font 240
+        draw.text((x, y), line, font=font, fill=fill_rgba,
+                  stroke_width=outline, stroke_fill=(0, 0, 0, 255))
         y += line_h
 
     return img.convert("RGB")
@@ -356,7 +435,7 @@ def genera_thumbnail(title: str, output_path: str, mood: str = None,
         "huggingface": ("FLUX/HF", lambda: _fetch_image_hf(prompt)),
         "openrouter":  ("FLUX/OR", lambda: _fetch_image_openrouter(prompt)),
         "pollinations": ("POLLINATIONS",
-                         lambda: _fetch_image_pollinations(title, mood=mood, style=style)),
+                         lambda: _fetch_image_pollinations(prompt, mood=mood, style=style)),
     }
     order = [_image_provider()] + [p for p in providers if p != _image_provider()]
 
@@ -367,7 +446,7 @@ def genera_thumbnail(title: str, output_path: str, mood: str = None,
         label, fetch = providers[name]
         try:
             print(f"[{label}] {prompt[:100]}...", flush=True)
-            img = fetch()
+            img = _porta_a_misura(fetch())
             break
         except Exception as e:
             print(f"[{label}] fallito: {e}", flush=True)

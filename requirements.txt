@@ -1,7 +1,7 @@
 edge-tts>=6.1.9
 rich>=13.0.0
 requests>=2.31.0
-moviepy>=1.0.3
+moviepy>=2.0.0
 Pillow>=10.0.0
 google-api-python-client>=2.100.0
 google-auth-oauthlib>=1.1.0
