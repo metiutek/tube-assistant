@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tube-assistant"
-version = "1.0.0"
+version = "1.1.0"
 description = "Autonomous YouTube content pipeline — script → TTS → clips → montage → upload"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -50,12 +50,17 @@ tube-assistant = "youtube_ai_agent.cli:main"
 
 [tool.setuptools]
 py-modules = ["agent", "main", "wizard"]
-
 # Install both youtube_ai_agent/ (CLI) and moduli/ (core logic) as top-level packages.
 # This means `from moduli.xxx import yyy` continues to work unchanged in all modules.
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["moduli*", "youtube_ai_agent*"]
+# `youtube_ai_agent.assets` maps the repo-level assets/ directory (kept there so the
+# README raw links and `python agent.py` from a git clone keep working) into the
+# wheel as youtube_ai_agent/assets/: without it `uv tool install git+...` shipped no
+# background music and no .env template, and `_workspace.scaffold` copied nothing.
+packages = ["moduli", "youtube_ai_agent", "youtube_ai_agent.assets", "youtube_ai_agent.template"]
+
+[tool.setuptools.package-dir]
+"youtube_ai_agent.assets" = "assets"
 
 [tool.setuptools.package-data]
-"youtube_ai_agent" = ["assets/**/*", "template/**/*"]
+"youtube_ai_agent.assets" = ["**/*.mp3", "*.png"]
+"youtube_ai_agent.template" = [".env.example"]

@@ -68,10 +68,10 @@ def scaffold(workspace: Path) -> None:
 
 
 def _find_template(filename: str) -> Path | None:
-    """Find a template file relative to this package or the git clone root."""
+    """Find a template file: bundled in the package, or at the git clone root."""
     candidates = [
-        Path(__file__).parent.parent / filename,   # git clone root
         Path(__file__).parent / "template" / filename,
+        Path(__file__).parent.parent / filename,   # git clone root (legacy layout)
     ]
     for c in candidates:
         if c.exists():
@@ -80,9 +80,15 @@ def _find_template(filename: str) -> Path | None:
 
 
 def _package_assets() -> Path:
-    """Return the bundled assets directory (in the package)."""
-    # Try git-clone root first
-    root = Path(__file__).parent.parent / "assets"
-    if root.exists():
-        return root
-    return Path(__file__).parent / "assets"
+    """Return the bundled assets directory.
+
+    In a wheel (`uv tool install`) pyproject maps the repo `assets/` into
+    `youtube_ai_agent/assets/`. In a git clone that directory does not exist
+    and the repo root is used. Checked in this order because `scaffold()`
+    creates `<root>/assets/custom/...` first: an empty root `assets/` used to
+    win and the music never got copied into the workspace.
+    """
+    bundled = Path(__file__).parent / "assets"
+    if (bundled / "music").exists():
+        return bundled
+    return Path(__file__).parent.parent / "assets"

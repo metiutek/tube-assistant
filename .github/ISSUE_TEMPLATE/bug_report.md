@@ -21,7 +21,7 @@ labels: bug
 - `AI_SERVICE`:
 - Install method: `uv tool install` / `pip install`
 
-**Logs (from `~/.youtube-ai-agent/logs/`):**
+**Logs (from `<workspace>/logs/` — `tube-assistant workspace` prints the path):**
 ```
 
 ```

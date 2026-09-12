@@ -1,58 +1,54 @@
 #!/bin/bash
-# YouTube AI Agent — Linux/Raspberry Pi installer
+# TubeAssistant — Linux/Raspberry Pi installer (from a git clone)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo ""
-echo "=== YouTube AI Agent — Setup ==="
+echo "=== TubeAssistant — Setup ==="
 echo ""
 
 # python check
 if ! command -v python3 &>/dev/null; then
-    echo "[!] python3 not found. Install with: sudo apt install python3 python3-pip"
+    echo "[!] python3 not found. Install with: sudo apt install python3 python3-pip python3-venv"
     exit 1
-fi
-
-PYTHON=python3
-if command -v python &>/dev/null && python --version 2>&1 | grep -q "Python 3"; then
-    PYTHON=python
 fi
 
 # ffmpeg check
 if ! command -v ffmpeg &>/dev/null; then
     echo "[!] ffmpeg not found. Installing..."
-    sudo apt-get install -y ffmpeg
+    sudo apt-get update && sudo apt-get install -y ffmpeg
 fi
 
 # venv
 if [ ! -d "venv" ]; then
     echo "[*] Creating virtual environment..."
-    $PYTHON -m venv venv
+    python3 -m venv venv
 fi
 
+# shellcheck disable=SC1091
 source venv/bin/activate
 
-echo "[*] Installing dependencies..."
+echo "[*] Installing TubeAssistant (editable) ..."
 pip install --upgrade pip -q
-pip install -r requirements.txt -q
+pip install -e . -q
 
 echo ""
 echo "[✓] Installation complete."
 echo ""
 
-# alias
+# alias: activates the venv and opens the interactive menu
 SHELL_RC="$HOME/.bashrc"
 [ -n "$ZSH_VERSION" ] && SHELL_RC="$HOME/.zshrc"
 
-ALIAS_LINE="alias agent='cd \"$SCRIPT_DIR\" && source venv/bin/activate && python agent.py'"
-if ! grep -q "alias agent=" "$SHELL_RC" 2>/dev/null; then
+ALIAS_LINE="alias tube-assistant='cd \"$SCRIPT_DIR\" && source venv/bin/activate && tube-assistant'"
+if ! grep -q "alias tube-assistant=" "$SHELL_RC" 2>/dev/null; then
     echo "$ALIAS_LINE" >> "$SHELL_RC"
-    echo "[✓] Added 'agent' alias to $SHELL_RC"
+    echo "[✓] Added 'tube-assistant' alias to $SHELL_RC"
     echo "    Run: source $SHELL_RC"
 fi
 
-echo "[*] Starting wizard..."
+echo "[*] Starting setup wizard..."
 echo ""
-python wizard.py
+tube-assistant onboard

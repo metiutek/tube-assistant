@@ -141,8 +141,9 @@ Step 1 — Agent language  Any language your Telegram assistant will speak
 Step 2 — AI Service      OpenRouter / Ollama Cloud / local Ollama / 12 more
 Step 3 — Image provider  Pollinations (free) or HuggingFace FLUX
 Step 4 — Pexels API      Free key for stock footage
-Step 5 — Telegram Bot    Token from @BotFather
-Step 6 — Channel setup   Name, niche, goals, style, language
+Step 5 — Clip source     Pexels stock, AI-generated, or hybrid (spend cap)
+Step 6 — Telegram Bot    Token from @BotFather
+Step 7 — Channel setup   Name, niche, goals, style, language
                           → Send your Google credentials.json
 ```
 
@@ -202,7 +203,8 @@ pip install "tube-assistant[anthropic]"  # or: gemini, mistral, groq, cohere, hu
 | **Local Ollama** | Free | `ollama_local` | — |
 
 Every model is overridable via env (e.g. `OPENAI_MODEL=gpt-4o`, `GROQ_MODEL=mixtral-8x7b-32768`).  
-See `.env.example` for the full list of variables.
+See [`youtube_ai_agent/template/.env.example`](youtube_ai_agent/template/.env.example) for the full list of variables
+(the wizard copies it to your workspace as `.env`).
 
 ---
 
@@ -213,10 +215,21 @@ tube-assistant              # interactive TUI menu (recommended)
 tube-assistant onboard      # first-time setup wizard
 tube-assistant start        # start the 24/7 daemon
 tube-assistant run          # one-shot pipeline (one video now)
+tube-assistant dry-run      # full pipeline, no upload (test your setup)
 tube-assistant clips        # clip source: Pexels stock or AI video generation
+tube-assistant preflight    # check keys, ffmpeg, credentials
 tube-assistant update       # update to latest version
 tube-assistant status       # show workspace and config
 tube-assistant workspace    # print workspace path
+```
+
+Workspace: `~/.youtube-ai-agent/` by default, the current directory when run from a git clone,
+or `YOUTUBE_AI_WORKSPACE` if set. Logs land in `<workspace>/logs/`.
+
+## Development
+
+```bash
+python -m unittest discover -s tests     # same suite CI runs (needs ffmpeg for the render tests)
 ```
 
 ---

@@ -425,3 +425,75 @@ class UsoDaUtenteTests(unittest.TestCase):
         sorgente = Path(__file__).parent.parent / "youtube_ai_agent" / "cli.py"
         self.assertIn('if __name__ == "__main__"',
                       sorgente.read_text(encoding="utf-8"))
+
+
+class PackagingTests(unittest.TestCase):
+    """Cio' che `uv tool install git+...` deve trovare nel pacchetto.
+
+    Prima `assets/` e `.env.example` vivevano solo nella root del repo: il wheel
+    non li conteneva, `_workspace.scaffold` non copiava nulla e chi installava
+    dal Quick Start otteneva video senza musica e un `.env` di sette righe.
+    """
+
+    def test_template_env_e_bundled_nel_pacchetto(self):
+        from youtube_ai_agent import _workspace
+
+        template = _workspace._find_template(".env.example")
+        self.assertIsNotNone(template, ".env.example non trovato ne' nel pacchetto ne' nella root")
+        self.assertEqual(template.parent.name, "template")
+        self.assertEqual(template.parent.parent.name, "youtube_ai_agent")
+        contenuto = template.read_text(encoding="utf-8")
+        for chiave in ("AI_SERVICE=", "PEXELS_API_KEY=", "TELEGRAM_BOT_TOKEN=", "VIDEO_SOURCE="):
+            self.assertIn(chiave, contenuto)
+
+    def test_musica_bundled_ha_tutti_i_mood(self):
+        from youtube_ai_agent import _workspace
+        from moduli.montaggio import ALLOWED_MOODS
+
+        music = _workspace._package_assets() / "music"
+        self.assertTrue(music.is_dir(), f"cartella musica assente: {music}")
+        for mood in ALLOWED_MOODS:
+            tracce = list((music / mood).glob("*.mp3"))
+            self.assertTrue(tracce, f"nessuna traccia per il mood '{mood}'")
+
+    def test_scaffold_copia_musica_e_template_nel_workspace(self):
+        from youtube_ai_agent import _workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            _workspace.scaffold(ws)
+            env = (ws / ".env").read_text(encoding="utf-8")
+            self.assertIn("VIDEO_SOURCE=", env, "scaffold ha scritto il .env minimale, non il template")
+            self.assertTrue(list((ws / "assets" / "music").rglob("*.mp3")), "musica non copiata nel workspace")
+            for d in ("output", "cache/pexels", "cache/ai_video", "logs", "assets/custom/clips"):
+                self.assertTrue((ws / d).is_dir(), f"manca {d}")
+
+    def test_pyproject_impacchetta_assets_e_template(self):
+        import tomllib
+
+        root = Path(__file__).resolve().parent.parent
+        cfg = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        st = cfg["tool"]["setuptools"]
+        self.assertIn("youtube_ai_agent.assets", st["packages"])
+        self.assertIn("youtube_ai_agent.template", st["packages"])
+        self.assertEqual(st["package-dir"]["youtube_ai_agent.assets"], "assets")
+        self.assertTrue(any(p.endswith("*.mp3") for p in st["package-data"]["youtube_ai_agent.assets"]))
+        self.assertIn(".env.example", st["package-data"]["youtube_ai_agent.template"])
+        self.assertEqual(cfg["project"]["scripts"], {"tube-assistant": "youtube_ai_agent.cli:main"})
+
+    def test_script_di_avvio_usano_il_comando_giusto(self):
+        root = Path(__file__).resolve().parent.parent
+        for nome in ("start.sh", "install.sh", "installa.bat", "avvia_agente.bat"):
+            testo = (root / nome).read_text(encoding="utf-8", errors="replace")
+            self.assertNotIn("youtube-ai-agent", testo, f"{nome} usa ancora il vecchio comando")
+            self.assertIn("tube-assistant", testo, f"{nome} non richiama tube-assistant")
+
+    def test_versione_pacchetto_allineata(self):
+        import tomllib
+        import youtube_ai_agent
+
+        root = Path(__file__).resolve().parent.parent
+        cfg = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(youtube_ai_agent.__version__, cfg["project"]["version"])
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{cfg['project']['version']}]", changelog)

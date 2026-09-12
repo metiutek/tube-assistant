@@ -36,7 +36,7 @@ Open an issue and include:
 2. What you expected
 3. What actually happened
 4. Your OS, Python version, and `AI_SERVICE` value
-5. Relevant logs from `~/.youtube-ai-agent/logs/`
+5. Relevant logs from `<workspace>/logs/` (`tube-assistant workspace` prints the path)
 
 ---
 
@@ -45,8 +45,9 @@ Open an issue and include:
 1. Fork the repo
 2. Create a branch: `git checkout -b fix/your-fix` or `feat/your-feature`
 3. Make your changes
-4. Test manually: `tube-assistant run` for pipeline, `tube-assistant onboard` for wizard
-5. Open a PR with a clear description of what changed and why
+4. Run the test suite: `python -m unittest discover -s tests` (CI runs the same command)
+5. Test manually: `tube-assistant dry-run` for the pipeline, `tube-assistant onboard` for the wizard
+6. Open a PR with a clear description of what changed and why
 
 Keep PRs focused — one fix or feature per PR.
 
@@ -58,7 +59,7 @@ Keep PRs focused — one fix or feature per PR.
 2. Add it to the `_PROVIDERS` dispatch table
 3. Add the model constant and env var at the top of the file
 4. Add the provider to `AI_SERVICES` in `wizard.py` with connection test
-5. Document the key in `.env.example`
+5. Document the key in `youtube_ai_agent/template/.env.example` and in `AI_KEY_BY_SERVICE` (`moduli/preflight.py`)
 
 Follow the existing pattern — lazy imports, clear error messages when the key is missing.
 
@@ -69,7 +70,7 @@ Follow the existing pattern — lazy imports, clear error messages when the key 
 - Match the style of the surrounding code
 - Comments and logs are in Italian (project convention) — code identifiers in English
 - No unnecessary abstractions — keep it simple and readable
-- No tests required, but manual testing before PR is expected
+- Add a regression test in `tests/` for behaviour changes; keep `python -m unittest discover -s tests` green
 
 ---
 

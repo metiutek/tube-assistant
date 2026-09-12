@@ -20,7 +20,7 @@ tube-assistant             # interactive menu — pick Setup wizard first
 
 **From source (git clone):**
 ```powershell
-.\installa.bat                  # pip install -e . + instructions
+.\installa.bat                  # uv tool install -e . + instructions
 tube-assistant onboard          # TUI wizard: AI service → Pexels → clip source → Telegram → channel setup
 tube-assistant start            # start daemon
 ```
@@ -30,7 +30,7 @@ The wizard writes `.env`, `preferenze_video.json`, `memoria_lungo_termine.json`,
 ```powershell
 python agent.py      # daemon (production)
 python main.py       # one-shot pipeline (no scheduler, no Telegram, no checkpoint)
-.\avvia_agente.bat   # background via pythonw
+.\avvia_agente.bat   # background (start /min tube-assistant start)
 ```
 
 Tests: `python -m unittest discover -s tests` (also run by `.github/workflows/tests.yml`).
@@ -42,15 +42,19 @@ delivery loudness/format, clip pool size vs segment count, stock-clip relevance,
 script length, one-shot captions, render progress and thumbnail safe area.
 `tests/test_video_ai.py` covers AI video generation: the three `VIDEO_SOURCE` modes,
 the spend cap, the fallback to Pexels, provider response parsing and the settings screen.
+`tests/test_regressioni_e2e.py` covers the CLI/workspace layer end to end, including
+packaging: the wheel must bundle `assets/music` and `template/.env.example` or a
+`uv tool install` user gets silent videos and an empty `.env`.
 
 Requires: FFmpeg in PATH (MoviePy), `credentials.json` (Google OAuth desktop), `.env` with AI service vars, `PEXELS_API_KEY`, Telegram bot token. All populated by `wizard.py`.
+The `.env` template lives at `youtube_ai_agent/template/.env.example` (bundled in the wheel);
+`_workspace.scaffold` copies it, plus `assets/music`, into a fresh workspace.
 
 ### AI service (`AI_SERVICE` in `.env`)
-| Value | Provider | Key var |
-|---|---|---|
-| `ollama_cloud` | Ollama hosted nemotron-3-super | `OLLAMA_API_KEY` |
-| `openrouter` | OpenRouter free/paid | `OPENROUTER_API_KEY` |
-| `ollama_local` | Local Ollama instance | `OLLAMA_LOCAL_MODEL` |
+15 providers (`openrouter`, `openai`, `anthropic`, `gemini`, `mistral`, `groq`, `deepseek`,
+`xai`, `cohere`, `together`, `perplexity`, `fireworks`, `azure_openai`, `ollama_cloud`,
+`ollama_local`). The value → key-variable map is `AI_KEY_BY_SERVICE` in `moduli/preflight.py`;
+the README table is the user-facing copy. Only OpenRouter and Ollama need no extra SDK.
 
 `ai_client.py:_primary()` routes to the configured service; `_fallback()` tries a secondary on failure.
 
@@ -132,3 +136,7 @@ Keys consumed by `agent.py`:
 - `ai_client.py` exposes `_primary()` (routes via `AI_SERVICE` env) and `_fallback()`. Don't bypass — add new providers there following the existing pattern.
 - Paths are constants at top of `agent.py` / `main.py` (`AUDIO_PATH`, `VIDEO_PATH`, `THUMB_PATH`). Reuse them.
 - `output/` and `cache/` are runtime artifacts. Don't commit. `credentials.json`, `token.json`, `.env` are secrets.
+- Packaging: `pyproject.toml` maps repo `assets/` to `youtube_ai_agent.assets` (package-dir) and
+  bundles `youtube_ai_agent/template/`. Keep `assets/` at the repo root (README raw links, git-clone
+  `python agent.py`), and add new bundled file types to the `package-data` patterns or the wheel drops them.
+- The console script is `tube-assistant`. `youtube-ai-agent` was the old name; don't reintroduce it in scripts or docs.

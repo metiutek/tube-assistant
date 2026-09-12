@@ -1,0 +1,18 @@
+# Normalise line endings: LF in the repo, native on checkout for text,
+# except shell scripts (must stay LF to run on Linux/macOS/WSL) and
+# Windows batch files (cmd.exe wants CRLF).
+* text=auto
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.py  text
+*.md  text
+*.toml text
+*.yml text
+*.txt text
+
+# Binary media
+*.mp3 binary
+*.mp4 binary
+*.gif binary
+*.png binary
+*.jpg binary

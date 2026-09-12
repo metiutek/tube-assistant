@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube AI Agent — First-time Setup Wizard
-Run once before starting the agent: python setup.py
+Run once before starting the agent: python wizard.py  (or: tube-assistant onboard)
 """
 
 import os
@@ -61,9 +61,16 @@ SETUP_DONE    = ".setup_done"
 def load_env() -> dict:
     if Path(ENV_FILE).exists():
         return dict(dotenv_values(ENV_FILE))
-    # bootstrap from example
-    if Path(".env.example").exists():
-        shutil.copy(".env.example", ENV_FILE)
+    # bootstrap from the template (bundled in the package, or repo root)
+    template = Path(".env.example")
+    if not template.exists():
+        try:
+            from youtube_ai_agent._workspace import _find_template
+            template = _find_template(".env.example")
+        except ImportError:
+            template = None
+    if template and template.exists():
+        shutil.copy(template, ENV_FILE)
         return dict(dotenv_values(ENV_FILE))
     return {}
 
