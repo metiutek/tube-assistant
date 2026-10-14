@@ -295,3 +295,7 @@ wizard.py               Configuration wizard
 ## License
 
 MIT — use, modify, and distribute freely.
+
+---
+
+made by https://metiu.xyz/
