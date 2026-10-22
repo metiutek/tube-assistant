@@ -800,6 +800,18 @@ def _overlay_captions_moviepy(video, captions_text: str | None,
 
 
 def monta_video(audio_path: str, keywords: list, clip_paths: dict, output_path: str, mood: str = None, on_progress=None, custom_music: str = None, captions_text: str = None) -> None:
+    from moduli import editor_vedit
+    if editor_vedit.attivo():
+        # vedit non deve mai far saltare il video: qualunque errore (pacchetto
+        # assente, filtro non supportato, render fallito) ripiega sul montaggio
+        # interno, che resta il percorso collaudato
+        try:
+            editor_vedit.monta_video_vedit(audio_path, keywords, clip_paths, output_path,
+                                           mood, on_progress, custom_music, captions_text)
+            return
+        except Exception as e:
+            print(f"[montaggio] vedit fallito, ripiego sul montaggio interno: {e}", flush=True)
+
     if _FFMPEG_ONLY:
         _monta_video_ffmpeg(audio_path, keywords, clip_paths, output_path, mood, on_progress, custom_music, captions_text)
         return

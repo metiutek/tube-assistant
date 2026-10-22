@@ -34,6 +34,23 @@ SORGENTI = {
 }
 
 
+# Chi monta il video. vedit e' un extra facoltativo: senza pacchetto la
+# pipeline ripiega da sola sul montaggio interno, quindi sceglierlo non rompe.
+EDITORI = {
+    "1": {
+        "id": "interno",
+        "nome": "Interno (default)",
+        "desc": "Montaggio ffmpeg/MoviePy di tube-assistant: tagli secchi, testi chiave, musica.",
+    },
+    "2": {
+        "id": "vedit",
+        "nome": "vedit (editorvideo-ai)",
+        "desc": "Timeline vera: transizioni, zoom lento, look colore per mood, musica che si "
+                "abbassa sotto la voce. Il progetto resta in output/ per ritoccarlo a mano.",
+    },
+}
+
+
 def _env_file(workspace: str | Path = ".") -> Path:
     return Path(workspace) / ".env"
 
@@ -70,6 +87,42 @@ def stato(workspace: str | Path = ".") -> str:
     return f"{etichetta} — {conf['etichetta']} / {modello} [{chiave}]"
 
 
+def stato_editor(workspace: str | Path = ".") -> str:
+    env = leggi_env(workspace)
+    editore = (env.get("VIDEO_EDITOR") or "interno").strip().lower()
+    if editore != "vedit":
+        return "interno"
+    from moduli.editor_vedit import disponibile
+    return "vedit" if disponibile() else "vedit [✗ pacchetto mancante — ripiego sull'interno]"
+
+
+def configura_editor(console, workspace: str | Path = ".") -> str:
+    """Sceglie chi monta il video. Ritorna 'interno' | 'vedit'."""
+    from rich.prompt import Prompt
+    from moduli.editor_vedit import disponibile
+
+    env = leggi_env(workspace)
+    attuale = (env.get("VIDEO_EDITOR") or "interno").strip().lower()
+    console.print()
+    console.print("  [bold]Chi monta il video:[/]\n")
+    for num, e in EDITORI.items():
+        segno = "[bold green]•[/]" if e["id"] == attuale else " "
+        console.print(f"  {segno} [cyan]{num}[/]  [bold]{e['nome']}[/]")
+        console.print(f"       [dim]{e['desc']}[/]")
+    console.print()
+    default = next((n for n, e in EDITORI.items() if e["id"] == attuale), "1")
+    scelta = EDITORI[Prompt.ask("  Scegli", choices=list(EDITORI), default=default)]["id"]
+    scrivi_env(workspace, "VIDEO_EDITOR", scelta)
+    if scelta == "vedit" and not disponibile():
+        console.print("  [bold yellow]⚠[/]  Pacchetto vedit non installato: finche' manca "
+                      "la pipeline usa il montaggio interno.")
+        from moduli.editor_vedit import INSTALLA
+        console.print(f"  [dim]Installa con: {INSTALLA}[/]")
+    else:
+        console.print(f"  [bold green]✓[/]  Montaggio: {stato_editor(workspace)}")
+    return scelta
+
+
 def _prova_generazione(console) -> None:
     """Genera una clip vera per verificare chiave e modello.
 
@@ -101,7 +154,14 @@ def _prova_generazione(console) -> None:
 
 
 def configura(console, workspace: str | Path = ".", intestazione=None) -> str:
-    """Menu interattivo. Ritorna la sorgente scelta ('pexels'|'ibrido'|'ai')."""
+    """Menu interattivo: sorgente clip, poi editor di montaggio.
+    Ritorna la sorgente scelta ('pexels'|'ibrido'|'ai')."""
+    sorgente = _configura_sorgente(console, workspace, intestazione)
+    configura_editor(console, workspace)
+    return sorgente
+
+
+def _configura_sorgente(console, workspace: str | Path = ".", intestazione=None) -> str:
     from rich.prompt import Prompt
 
     env = leggi_env(workspace)

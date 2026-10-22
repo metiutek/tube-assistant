@@ -890,6 +890,8 @@ def main() -> None:
     table.add_row("Image Provider",  env_vals.get("IMAGE_PROVIDER", "pollinations"))
     from moduli.impostazioni_video import stato as _stato_clip
     table.add_row("Clip video",      _stato_clip("."))
+    from moduli.impostazioni_video import stato_editor as _stato_editor
+    table.add_row("Montaggio",       _stato_editor("."))
     table.add_row("Language",        data.get("language", "english"))
     table.add_row("Channel",         data.get("channel_name", "—"))
     table.add_row("Credentials",     "✓ saved" if Path(CREDS_FILE).exists() else "✗ not found")

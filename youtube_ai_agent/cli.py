@@ -282,6 +282,8 @@ def _print_status(workspace: Path) -> None:
         from moduli.impostazioni_video import stato as _stato_clip
         load_dotenv(env_file)
         print(f"  clip      : {_stato_clip(workspace)}")
+        from moduli.impostazioni_video import stato_editor as _stato_editor
+        print(f"  montaggio : {_stato_editor(workspace)}")
     except Exception:
         pass
 

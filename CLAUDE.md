@@ -42,6 +42,8 @@ delivery loudness/format, clip pool size vs segment count, stock-clip relevance,
 script length, one-shot captions, render progress and thumbnail safe area.
 `tests/test_video_ai.py` covers AI video generation: the three `VIDEO_SOURCE` modes,
 the spend cap, the fallback to Pexels, provider response parsing and the settings screen.
+`tests/test_editor_vedit.py` covers the vedit montage engine: editor choice, fallback to the
+internal montage, the timeline it builds and a real render (self-skips without `vedit`/ffmpeg).
 `tests/test_regressioni_e2e.py` covers the CLI/workspace layer end to end, including
 packaging: the wheel must bundle `assets/music` and `template/.env.example` or a
 `uv tool install` user gets silent videos and an empty `.env`.
@@ -69,7 +71,7 @@ Pipeline = 7 stages, each a module in `moduli/`. `agent.py:run_pipeline` orchest
 | Brain | `cervello.py` → `ai_client.py` | Topic + JSON script (Ollama Cloud primary, OpenRouter fallback) |
 | Audio | `audio.py` | edge-tts → `output/narration.mp3` |
 | Clips | `asset.py` → `video_ai.py` | Pexels search/download → `cache/pexels/`, plus AI-generated clips → `cache/ai_video/` |
-| Montage | `montaggio.py` | MoviePy concat + audio sync → `output/output_finale.mp4` |
+| Montage | `montaggio.py` → `editor_vedit.py` | MoviePy/ffmpeg concat + audio sync → `output/output_finale.mp4`, or vedit when `VIDEO_EDITOR=vedit` |
 | Thumbnail | `thumbnail.py` | Pollinations.ai image + Pillow text overlay |
 | Publish | `pubblica.py` | YouTube Data API v3 upload + `calcola_publish_slots` for scheduling |
 
@@ -102,8 +104,25 @@ Rules that must not be broken when touching this path:
 - Generated clips are cached by prompt+model hash and pruned with a separate cap
   (`MAX_AI_CACHE_MB`) so free stock never evicts something that cost money.
 
+### Montage engine (`VIDEO_EDITOR` in `.env`)
+`interno` (default) is the ffmpeg/MoviePy montage in `montaggio.py`. `vedit` hands the same
+decisions (clip sequence, key captions, mood music) to [vedit](https://github.com/metiutek/editorvideo-ai)
+(`moduli/editor_vedit.py`, optional extra `editor` = PyPI `vedit-mcp`), which adds dissolves every
+`VEDIT_TRANSIZIONE_OGNI` cuts, Ken Burns zoom, a mood-driven colour look (`VEDIT_LOOK`), music
+ducked under the voice via sidechain and loudnorm to `AUDIO_LUFS`. The project is saved to
+`output/progetto_vedit.json`, so `vedit ui output/progetto_vedit.json` reopens the exact timeline.
+
+Rules:
+- **vedit never fails the video.** `montaggio.monta_video` catches any vedit error (package
+  missing included) and falls back to the internal montage.
+- `editor_vedit.costruisci_progetto` reuses `montaggio._build_clip_sequence` / `_select_key_captions`
+  / `_pick_music`: never re-derive them, or AI clips stop landing on the first segments.
+- A transition's overlap extends the outgoing clip under the next one; the next segment keeps its
+  start, so video length stays equal to the narration.
+- `VIDEO_EDITOR` is written only by `impostazioni_video.configura_editor` (shown after the clip-source menu).
+
 Side channels:
-- `moduli/impostazioni_video.py` — the clip-source settings screen, shared by `wizard.py`
+- `moduli/impostazioni_video.py` — the clip-source + montage-engine settings screen, shared by `wizard.py`
   (step 5/7) and the TUI (`tube-assistant clips`, menu entry "Video clips"). Keep it the
   single place that writes `VIDEO_*` keys to `.env`, or the two menus drift apart.
 - `moduli/scheduling.py` — single source of truth for production/publish hours. `agent.py`, `telegram_handler.py` and `pubblica.py` all call it; never re-derive hours locally or `/orari` starts announcing a schedule the daemon doesn't follow.

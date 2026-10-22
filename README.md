@@ -267,6 +267,32 @@ menu): source, provider, API key, model and the cap. If the provider is down or
 out of credit the pipeline falls back to Pexels instead of publishing a video
 with no b-roll.
 
+### Editing with vedit (optional)
+
+Set `VIDEO_EDITOR=vedit` (or pick it in `tube-assistant clips`, after the clip
+source) to have [vedit](https://github.com/metiutek/editorvideo-ai) cut the video
+instead of the built-in montage. Same clips, captions and music — but built as a
+real timeline: dissolves every few cuts, slow Ken Burns zoom, a colour look picked
+from the script mood, music that ducks under the voice, loudness at -14 LUFS.
+
+```bash
+uv tool install --force "tube-assistant[editor] @ git+https://github.com/metiu1/tube-assistant.git"
+```
+
+The project is kept in `output/progetto_vedit.json`: open it with
+`vedit ui output/progetto_vedit.json` to touch up a video by hand before
+publishing. If vedit is missing or its render fails, the pipeline falls back to
+the built-in montage — it never skips a video.
+
+| Variable | Default | |
+|---|---|---|
+| `VIDEO_EDITOR` | `interno` | `interno` or `vedit` |
+| `VEDIT_LOOK` | `auto` | `auto` (from mood), `nessuno`, or a vedit look id |
+| `VEDIT_TRANSIZIONE` | `dissolve` | any vedit transition, or `nessuna` |
+| `VEDIT_TRANSIZIONE_OGNI` | `3` | one transition every N cuts |
+| `VEDIT_KENBURNS` | `1` | slow zoom on every clip |
+| `VEDIT_QUALITA` | `high` | `draft` / `medium` / `high` / `max` |
+
 ---
 
 ## Architecture
@@ -280,6 +306,7 @@ moduli/
   video_ai.py           AI video generation (Replicate / fal.ai / Luma / OpenRouter)
   impostazioni_video.py Clip-source settings screen (wizard + TUI)
   montaggio.py          Video editing (FFmpeg / MoviePy)
+  editor_vedit.py       Optional montage with vedit (VIDEO_EDITOR=vedit)
   thumbnail.py          AI thumbnail (Pollinations.ai / HuggingFace + Pillow)
   pubblica.py           YouTube Data API v3 upload
   analytics.py          Channel performance reading
