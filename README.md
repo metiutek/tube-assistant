@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/metiu1/tube-assistant/master/assets/logo.png" alt="TubeAssistant Logo" width="380"/>
+  <img src="https://raw.githubusercontent.com/metiutek/tube-assistant/master/assets/logo.png" alt="TubeAssistant Logo" width="380"/>
 </p>
 
 <h1 align="center">TubeAssistant — AI Agent for YouTube</h1>
@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/github/stars/metiu1/tube-assistant?style=flat-square&color=FF0000" alt="Stars"/>
+  <img src="https://img.shields.io/github/stars/metiutek/tube-assistant?style=flat-square&color=FF0000" alt="Stars"/>
   <img src="https://img.shields.io/badge/python-3.11+-blue?style=flat-square" alt="Python"/>
   <img src="https://img.shields.io/badge/cost-%240%2Fmonth-brightgreen?style=flat-square" alt="Cost"/>
   <img src="https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square" alt="License"/>
@@ -17,11 +17,11 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/metiu1/tube-assistant/master/presentazione.gif" alt="TubeAssistant demo" width="820"/>
+  <img src="https://raw.githubusercontent.com/metiutek/tube-assistant/master/presentazione.gif" alt="TubeAssistant demo" width="820"/>
 </p>
 
 <p align="center">
-  <em><a href="https://github.com/metiu1/tube-assistant/raw/master/presentazione_tube_assistant.mp4">▶ Watch the full demo with sound</a></em>
+  <em><a href="https://github.com/metiutek/tube-assistant/raw/master/presentazione_tube_assistant.mp4">▶ Watch the full demo with sound</a></em>
 </p>
 
 ---
@@ -75,7 +75,7 @@ TubeAssistant eliminates every step. It runs 24/7, reads your channel analytics,
 
 ```bash
 pip install uv                                                    # fast installer (one-time)
-uv tool install git+https://github.com/metiu1/tube-assistant.git
+uv tool install git+https://github.com/metiutek/tube-assistant.git
 tube-assistant             # interactive menu — pick Setup wizard first
 ```
 
@@ -120,7 +120,7 @@ Everything controllable in real time via **Telegram** — just message your bot.
 
 ```bash
 # Clone
-git clone https://github.com/metiu1/tube-assistant.git
+git clone https://github.com/metiutek/tube-assistant.git
 cd tube-assistant
 
 # Install
@@ -276,7 +276,7 @@ real timeline: dissolves every few cuts, slow Ken Burns zoom, a colour look pick
 from the script mood, music that ducks under the voice, loudness at -14 LUFS.
 
 ```bash
-uv tool install --force "tube-assistant[editor] @ git+https://github.com/metiu1/tube-assistant.git"
+uv tool install --force "tube-assistant[editor] @ git+https://github.com/metiutek/tube-assistant.git"
 ```
 
 The project is kept in `output/progetto_vedit.json`: open it with
