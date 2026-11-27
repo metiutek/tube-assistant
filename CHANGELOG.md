@@ -4,6 +4,10 @@ All notable changes to TubeAssistant are documented here.
 
 ---
 
+## [1.1.1] — 2026-11-27
+### Security
+- `tube-assistant update`, the setup wizard and the vedit module now install from the repository's current address (`github.com/metiutek/tube-assistant`). They still used the old account name `metiu1`, which only worked through GitHub's rename redirect: if that name were registered by someone else, an update would have installed their code. Docs and README links moved too.
+
 ## [1.1.0] — 2026-09-12
 
 ### Added

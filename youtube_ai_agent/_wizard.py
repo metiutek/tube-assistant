@@ -23,6 +23,6 @@ def main():
     try:
         import wizard
     except ImportError:
-        print("[!] Setup wizard not found. Reinstall with: uv tool install --force git+https://github.com/metiu1/tube-assistant.git")
+        print("[!] Setup wizard not found. Reinstall with: uv tool install --force git+https://github.com/metiutek/tube-assistant.git")
         sys.exit(1)
     wizard.main()

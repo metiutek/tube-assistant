@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tube-assistant"
-version = "1.1.0"
+version = "1.1.1"
 description = "Autonomous YouTube content pipeline — script → TTS → clips → montage → upload"
 readme = "README.md"
 requires-python = ">=3.11"

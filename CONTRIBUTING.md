@@ -17,7 +17,7 @@ Thanks for your interest in contributing. Here's everything you need to know.
 ## Development setup
 
 ```bash
-git clone https://github.com/metiu1/tube-assistant.git
+git clone https://github.com/metiutek/tube-assistant.git
 cd tube-assistant
 
 pip install uv

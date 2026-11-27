@@ -25,7 +25,7 @@ PROGETTO_PATH = os.path.join("output", "progetto_vedit.json")
 EDITORI = ("interno", "vedit")
 
 INSTALLA = ('uv tool install --force "tube-assistant[editor] @ '
-            'git+https://github.com/metiu1/tube-assistant.git" '
+            'git+https://github.com/metiutek/tube-assistant.git" '
             '(da un clone: pip install -e ".[editor]")')
 
 # Mood dello script -> look di vedit (presets.LOOKS). I mood senza voce

@@ -14,7 +14,7 @@ Autonomous YouTube content pipeline. Daemon (`agent.py`) runs 24/7, triggers per
 **Quick Start (recommended — no cloning needed):**
 ```bash
 pip install uv                                                    # fast installer (one-time)
-uv tool install git+https://github.com/metiu1/tube-assistant.git
+uv tool install git+https://github.com/metiutek/tube-assistant.git
 tube-assistant             # interactive menu — pick Setup wizard first
 ```
 

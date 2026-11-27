@@ -345,7 +345,7 @@ def cmd_update() -> None:
     try:
         result = subprocess.run(
             ["uv", "tool", "install", "--force",
-             "git+https://github.com/metiu1/tube-assistant.git"],
+             "git+https://github.com/metiutek/tube-assistant.git"],
             text=True,
         )
     except (FileNotFoundError, OSError):
@@ -358,7 +358,7 @@ def cmd_update() -> None:
         print("\n  ✓ Aggiornamento completato. Riavvia con: tube-assistant\n")
     else:
         print("\n  ✗ Aggiornamento fallito. Riprova manualmente:\n")
-        print("    uv tool install --force git+https://github.com/metiu1/tube-assistant.git\n")
+        print("    uv tool install --force git+https://github.com/metiutek/tube-assistant.git\n")
     sys.exit(0)
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start TubeAssistant in background (Linux/macOS).
-# Requires the CLI installed: `uv tool install git+https://github.com/metiu1/tube-assistant.git`
+# Requires the CLI installed: `uv tool install git+https://github.com/metiutek/tube-assistant.git`
 # or, from a clone, `uv tool install -e .`
 set -e
 if ! command -v tube-assistant >/dev/null 2>&1; then
