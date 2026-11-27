@@ -325,4 +325,4 @@ MIT — use, modify, and distribute freely.
 
 ---
 
-made by https://metiu.xyz/
+Created by [Mattia Cibin (Metiu)](https://metiu.xyz/) — independent developer from Italy.
